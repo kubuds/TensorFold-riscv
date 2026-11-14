@@ -45,7 +45,8 @@ fn expectClose(got: []const f32, want: []const f64, rel: f64, abs: f64) !void {
     var max_err: f64 = 0;
     for (got, want) |g, w| max_err = @max(max_err, @abs(@as(f64, g) - w));
     if (max_err > rel * max_want + abs) {
-        std.debug.print("max_err {e} over tol {e} (rel {e} on scale {e})\n", .{ max_err, rel * max_want + abs, rel, max_want });
+        std.debug.print("max_err {e} over tol {e} (rel {e} on scale {e}) family {s}\n", .{ max_err, rel * max_want + abs, rel, max_want, kernels.activeKernels() });
+        for (0..@min(4, got.len)) |i| std.debug.print("  got[{d}]={e} want[{d}]={e}\n", .{ i, got[i], i, want[i] });
         return error.TestExpectedEqual;
     }
 }
@@ -102,6 +103,10 @@ test "riscv kernels: rope against the float64 reference" {
         defer a.free(k);
         fill(q, pos + 11);
         fill(k, pos + 29);
+        const q0 = try a.dupe(f32, q);
+        defer a.free(q0);
+        const k0 = try a.dupe(f32, k);
+        defer a.free(k0);
         const qf = try toF64(a, q);
         defer a.free(qf);
         const kf = try toF64(a, k);
@@ -109,6 +114,9 @@ test "riscv kernels: rope against the float64 reference" {
         ref.rope(qf, kf, pos, q_heads, kv_heads, head_dim, 1e6);
         for (families) |fam| {
             if (!kernels.select(fam)) continue;
+            // Rope is in place: every family starts from the same rows.
+            @memcpy(q, q0);
+            @memcpy(k, k0);
             c.tf_riscv_rope(q.ptr, k.ptr, @intCast(pos), q_heads, kv_heads, head_dim, 1e6);
             try expectClose(q, qf, 1e-5, 1e-6);
             try expectClose(k, kf, 1e-5, 1e-6);
@@ -122,11 +130,15 @@ test "riscv kernels: softmax against the float64 reference" {
         const x = try a.alloc(f32, n);
         defer a.free(x);
         fill(x, n * 7 + 3);
+        const x0 = try a.dupe(f32, x);
+        defer a.free(x0);
         const xf = try toF64(a, x);
         defer a.free(xf);
         ref.softmax(xf);
         for (families) |fam| {
             if (!kernels.select(fam)) continue;
+            // Softmax is in place: every family starts from the same row.
+            @memcpy(x, x0);
             c.tf_riscv_softmax(x.ptr, @intCast(n));
             try expectClose(x, xf, 1e-5, 1e-7);
         }
