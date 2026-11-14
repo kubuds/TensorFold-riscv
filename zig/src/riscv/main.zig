@@ -10,6 +10,7 @@
 //! the K3 measurements this CLI prints as receipts.
 const std = @import("std");
 const kernels = @import("kernels.zig");
+const blas = @import("blas.zig");
 const qwen3 = @import("qwen3.zig");
 const tokenizer = @import("tokenizer");
 const build_info = @import("riscv_build");
@@ -64,6 +65,9 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         if (std.mem.eql(u8, args[i], "--kernels") and i + 1 < args.len) {
             i += 1;
             pick = args[i];
+        } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
+            i += 1;
+            blas.setThreads(@intCast(std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{})));
         } else fail("caps: unknown argument {s}", .{args[i]});
     }
     if (pick) |p| {
@@ -75,6 +79,7 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         \\version: {s}
         \\kernels: {s}
         \\vlen_bits: {d}
+        \\blas: {s}
         \\cap_rvv: {}
         \\cap_ime1: {}
         \\cap_ime2: {}
@@ -83,6 +88,7 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         build_info.version,
         kernels.activeKernels(),
         kernels.vlenBits(),
+        blas.name(),
         caps & kernels.Cap.rvv != 0,
         caps & kernels.Cap.ime1 != 0,
         caps & kernels.Cap.ime2 != 0,
@@ -112,7 +118,7 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             continue;
         }
         const key = a[2..];
-        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report");
+        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report") or std.mem.eql(u8, key, "threads");
         for (extras) |e| known = known or std.mem.eql(u8, e, key);
         if (!known) fail("unknown flag --{s}", .{key});
         if (i + 1 >= args.len) fail("--{s} needs a value", .{key});
@@ -123,6 +129,8 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             common.context = std.fmt.parseInt(usize, args[i], 10) catch fail("--context needs a number", .{});
         } else if (std.mem.eql(u8, key, "report")) {
             common.report = args[i];
+        } else if (std.mem.eql(u8, key, "threads")) {
+            blas.setThreads(@intCast(std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{})));
         } else {
             common.values.put(gpa, key, args[i]) catch unreachable;
         }
@@ -258,6 +266,7 @@ fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]
         .command = "run",
         .kernels = kernels.activeKernels(),
         .vlen_bits = kernels.vlenBits(),
+        .blas = blas.name(),
         .prompt_tokens = prompt_ids.len,
         .generated = generated.items.len,
         .prefill_seconds = prefill_s,
@@ -319,6 +328,7 @@ fn benchCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:
         .command = "bench",
         .kernels = kernels.activeKernels(),
         .vlen_bits = kernels.vlenBits(),
+        .blas = blas.name(),
         .prefill_tokens = prefill_n,
         .prefill_seconds = prefill_s,
         .prefill_tok_s = @as(f64, @floatFromInt(prefill_n)) / @max(prefill_s, 1e-9),

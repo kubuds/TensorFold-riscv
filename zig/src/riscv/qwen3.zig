@@ -13,6 +13,7 @@
 const std = @import("std");
 const st = @import("safetensors.zig");
 const kernels = @import("kernels.zig");
+const blas = @import("blas.zig");
 
 const c = kernels.c;
 
@@ -77,12 +78,16 @@ pub const Model = struct {
         m.* = undefined;
     }
 
-    /// out[m,n] = x[m,k] @ w[n,k]^T through the backend's kernels.
+    /// out[m,n] = x[m,k] @ w[n,k]^T: OpenBLAS when it is loaded and the
+    /// product is f32 with several rows, else the backend's kernels.
     pub fn project(m: *const Model, w: Weight, x: []const f32, out: []f32, rows: usize) void {
         _ = m;
         switch (w.kind) {
             .bf16 => c.tf_riscv_matmul_bf16(x.ptr, w.bf16Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols)),
-            .f32 => c.tf_riscv_matmul_f32(x.ptr, w.f32Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 1),
+            .f32 => {
+                if (rows >= 4 and blas.gemmRowMajorTN(rows, w.rows, w.cols, x.ptr, w.f32Lanes().ptr, out.ptr)) return;
+                c.tf_riscv_matmul_f32(x.ptr, w.f32Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 1);
+            },
         }
     }
 
