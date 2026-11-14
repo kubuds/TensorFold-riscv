@@ -55,8 +55,17 @@ fn kernelModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     });
     mod.addIncludePath(b.path("zig/kernels/riscv"));
     mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
-    mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
-    if (wantsV(target)) mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_rvv.c"), .flags = &cflags });
+    if (wantsV(target)) {
+        // IME2 with its inlined reference MMA: the tests exercise the tiling
+        // and dispatch under qemu at VLEN=256 and VLEN=1024. dispatch.c must
+        // see the same defines to compile the family in.
+        const ime2c = cflags ++ .{ "-DTF_RISCV_WITH_IME2", "-DTF_RISCV_IME2_INLINE" };
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &ime2c });
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_rvv.c"), .flags = &cflags });
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ime2.c"), .flags = &ime2c });
+    } else {
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
+    }
     return mod;
 }
 
@@ -130,8 +139,16 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         });
         mod.addIncludePath(b.path("zig/kernels/riscv"));
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
-        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
-        if (wantsV(cli_target)) mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_rvv.c"), .flags = &cflags });
+        const ime2_inline = b.option(bool, "riscv-ime2-inline", "Compile the IME2 reference MMA into the CLI (correctness bring-up; the vendor runtime is the production path)") orelse false;
+        if (wantsV(cli_target)) {
+            var ime2_flags: std.ArrayListUnmanaged([]const u8) = .empty;
+            try_ime2_flags(b, &ime2_flags, ime2_inline);
+            mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = ime2_flags.items });
+            mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_rvv.c"), .flags = &cflags });
+            mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ime2.c"), .flags = ime2_flags.items });
+        } else {
+            mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
+        }
         mod.addOptions("riscv_build", buildOptions(b));
         const tokenizer_mod = b.createModule(.{
             .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"),
@@ -151,6 +168,13 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         const parity_step = b.step("riscv-parity", "tensorfold-riscv against an independent numpy Qwen3 forward");
         parity_step.dependOn(&parity.step);
     }
+}
+
+/// cflags plus the IME2 defines for dispatch.c and ime2.c.
+fn try_ime2_flags(b: *std.Build, out: *std.ArrayListUnmanaged([]const u8), inline_mma: bool) void {
+    out.appendSlice(b.allocator, &cflags) catch @panic("oom");
+    out.append(b.allocator, "-DTF_RISCV_WITH_IME2") catch @panic("oom");
+    if (inline_mma) out.append(b.allocator, "-DTF_RISCV_IME2_INLINE") catch @panic("oom");
 }
 
 /// Build facts the CLI prints in `caps` receipts.

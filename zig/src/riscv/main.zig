@@ -28,8 +28,11 @@ const usage =
     \\MODEL is a Hugging Face Qwen3 checkpoint directory (config.json,
     \\model.safetensors or its index + shards, tokenizer.json).
     \\
+    \\--cpus LIST pins the process ("0-7" the X100 set, "8-15" the A100 set on K3).
+    \\
     \\Environment:
     \\  TF_RISCV_KERNELS  kernel family to select at startup (scalar|rvv|ime2|auto)
+    \\  TF_RISCV_IME2     path to the SpacemiT IME2 vendor runtime (ime2_abi.h)
     \\
 ;
 
@@ -118,7 +121,7 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             continue;
         }
         const key = a[2..];
-        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report") or std.mem.eql(u8, key, "threads");
+        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report") or std.mem.eql(u8, key, "threads") or std.mem.eql(u8, key, "cpus");
         for (extras) |e| known = known or std.mem.eql(u8, e, key);
         if (!known) fail("unknown flag --{s}", .{key});
         if (i + 1 >= args.len) fail("--{s} needs a value", .{key});
@@ -131,6 +134,8 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             common.report = args[i];
         } else if (std.mem.eql(u8, key, "threads")) {
             blas.setThreads(@intCast(std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{})));
+        } else if (std.mem.eql(u8, key, "cpus")) {
+            if (kernels.c.tf_riscv_bind_cpus(args[i].ptr) != 0) fail("cannot pin to CPUs {s}", .{args[i]});
         } else {
             common.values.put(gpa, key, args[i]) catch unreachable;
         }

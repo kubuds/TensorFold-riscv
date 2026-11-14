@@ -9,10 +9,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 // (c) 2026 TensorFold contributors; see NOTICE and LICENSE.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE // cpu_set_t and CPU_SET for sched_setaffinity: first line
+#endif
 #include "tf_riscv.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 typedef struct {
     const char *name;
@@ -142,6 +146,39 @@ uint32_t tf_riscv_vlen_bits(void) { return 0; }
 #endif
 
 const char *tf_riscv_active_kernels(void) { return ops->name; }
+
+// "0-7,9" -> cpuset; Linux-only, the K3 deployment target.
+#if defined(__linux__)
+#include <sched.h>
+int tf_riscv_bind_cpus(const char *spec) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (!spec || !*spec) return -1;
+    const char *p = spec;
+    while (*p) {
+        char *end;
+        long a = strtol(p, &end, 10);
+        if (end == p || a < 0 || a >= CPU_SETSIZE) return -1;
+        long b = a;
+        p = end;
+        if (*p == '-') {
+            p++;
+            b = strtol(p, &end, 10);
+            if (end == p || b < a || b >= CPU_SETSIZE) return -1;
+            p = end;
+        }
+        for (long c = a; c <= b; c++) CPU_SET((int)c, &set);
+        if (*p == ',') p++;
+        else if (*p) return -1;
+    }
+    return sched_setaffinity(0, sizeof(set), &set) == 0 ? 0 : -1;
+}
+#else
+int tf_riscv_bind_cpus(const char *spec) {
+    (void)spec;
+    return -1;
+}
+#endif
 
 static const tf_riscv_ops *find(const char *name) {
     if (strcmp(name, "scalar") == 0) return &scalar_ops;

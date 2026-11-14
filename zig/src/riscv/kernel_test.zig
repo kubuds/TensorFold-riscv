@@ -229,7 +229,14 @@ test "riscv kernels: matmul_f32 and matmul_bf16 against the float64 reference" {
                 for (families) |fam| {
                     if (!kernels.select(fam)) continue;
                     c.tf_riscv_matmul_bf16(x.ptr, w.ptr, got.ptr, @intCast(m), @intCast(n), @intCast(k));
-                    try expectClose(got, want_b, 1e-4, 1e-5);
+                    // The IME2 MMA multiplies bf16 lanes (its A operand rounds
+                    // x to bf16): the family's products carry input rounding
+                    // the f32 families do not. That is the IME2 contract from
+                    // the K3 paper, not drift - so it gets its own tolerance.
+                    if (std.mem.eql(u8, fam, "ime2"))
+                        try expectClose(got, want_b, 2e-3, 1e-3) // bf16-input bound
+                    else
+                        try expectClose(got, want_b, 1e-4, 1e-5);
                 }
             }
         }

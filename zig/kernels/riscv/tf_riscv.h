@@ -37,6 +37,11 @@ const char *tf_riscv_active_kernels(void); // "scalar", "rvv" or "ime2"
 // Returns 0 on success, -1 when the name is unknown or not usable here.
 int tf_riscv_select_kernels(const char *name);
 
+// Pin this process to a CPU list ("0-7", "8-15", "0,2,4"): K3 schedules AI
+// work on the A100 set (8-15) and general work on the X100 set (0-7).
+// Returns 0 on success, -1 on a bad spec or when the platform refuses.
+int tf_riscv_bind_cpus(const char *spec);
+
 // out = x * rsqrt(mean(x*x) + eps) * w, n elements (w may be NULL for plain norm).
 void tf_riscv_rmsnorm(const float *x, const float *w, float *out, int n, float eps);
 

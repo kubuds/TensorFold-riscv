@@ -8,6 +8,7 @@ pub const c = struct {
     pub extern "C" fn tf_riscv_vlen_bits() u32;
     pub extern "C" fn tf_riscv_active_kernels() [*:0]const u8;
     pub extern "C" fn tf_riscv_select_kernels(name: [*:0]const u8) c_int;
+    pub extern "C" fn tf_riscv_bind_cpus(spec: [*:0]const u8) c_int;
 
     pub extern "C" fn tf_riscv_rmsnorm(x: [*]const f32, w: ?[*]const f32, out: [*]f32, n: c_int, eps: f32) void;
     pub extern "C" fn tf_riscv_rope(q: [*]f32, k: [*]f32, pos: c_int, q_heads: c_int, kv_heads: c_int, head_dim: c_int, theta: f32) void;

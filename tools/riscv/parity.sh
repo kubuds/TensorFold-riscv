@@ -2,7 +2,8 @@
 # parity.sh - the numeric gates for tensorfold-riscv: the numpy oracle over
 # the kernel path and over the OpenBLAS path (a stub cblas_sgemm proves the
 # code path; the real library is measured on K3).
-# Usage: tools/riscv/parity.sh [BIN]   (default zig-out/bin/tensorfold-riscv)
+# Usage: tools/riscv/parity.sh [BIN]   (default zig-out/bin/tensorfold-riscv;
+# BIN must run on this machine - rebuild with -Dtarget for K3 before measuring)
 set -eu
 BIN="${1:-zig-out/bin/tensorfold-riscv}"
 HERE="$(dirname "$0")"
