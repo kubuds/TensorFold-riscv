@@ -29,7 +29,7 @@ fn riscvTarget(b: *std.Build, abi: std.Target.Abi) std.Build.ResolvedTarget {
 /// The kernel + binding module for `target`: the scalar family and its dispatch.
 fn kernelModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/riscv/kernel_test.zig"),
+        .root_source_file = b.path("zig/src/riscv/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -88,9 +88,23 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
         mod.addOptions("riscv_build", buildOptions(b));
+        const tokenizer_mod = b.createModule(.{
+            .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"),
+            .target = mod.resolved_target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("tokenizer", tokenizer_mod);
         const exe = b.addExecutable(.{ .name = "tensorfold-riscv", .root_module = mod });
         const step = b.step("riscv-cli", "tensorfold-riscv: the RISC-V CPU runner (caps; qwen3 and bench follow)");
         step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
+        // riscv-parity: the numpy oracle over the freshly built binary.
+        const parity = b.addSystemCommand(&.{"python3"});
+        parity.addArgs(&.{ "tools/riscv/qwen3_parity.py", "--bin" });
+        parity.addArtifactArg(exe);
+        const parity_step = b.step("riscv-parity", "tensorfold-riscv against an independent numpy Qwen3 forward");
+        parity_step.dependOn(&parity.step);
     }
 }
 
