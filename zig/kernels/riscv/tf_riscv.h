@@ -49,6 +49,16 @@ void tf_riscv_rmsnorm(const float *x, const float *w, float *out, int n, float e
 // position `pos`: q holds q_heads*head_dim, k holds kv_heads*head_dim.
 void tf_riscv_rope(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta);
 
+// The split form the runner uses: the per-position (sin, cos) table is the
+// same for every layer (freq only depends on the head and dim index), so it
+// is built once per token and each layer's q/k just applies the rotation.
+// Table layout per head h and pair i in [0, head_dim/2):
+//   s[0][h * head_dim/2 + i], s[1][...]: sin and cos of pos * freq(h, i).
+void tf_riscv_rope_table(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_table_rvv(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_apply_rvv(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
+void tf_riscv_rope_apply(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
+
 // In-place row softmax over n elements.
 void tf_riscv_softmax(float *x, int n);
 
@@ -106,6 +116,7 @@ int tf_riscv_q4x_perm_k(int u);
 // int8 activation tiles + per-row group scales (tutorial: qwen3.zig quantizeQ4x).
 void tf_riscv_quant_a(const float *x, int8_t *xa, float *xs, int m, int k);
 void tf_riscv_quant_a_scalar(const float *x, int8_t *xa, float *xs, int m, int k);
+void tf_riscv_quant_a_rvv(const float *x, int8_t *xa, float *xs, int m, int k);
 
 // Decode (m == 1) and prefill (m rows): out[m][n] = x[m][k] @ w[n][k]^T.
 void tf_riscv_gemv_q4x(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k);
@@ -137,6 +148,7 @@ void tf_riscv_hpage_free(void *p, size_t bytes);
 int tf_riscv_hpage_available(void);
 size_t tf_riscv_hpage_backed(const void *p);
 size_t tf_riscv_hpage_bytes(void);
+size_t tf_riscv_hpage_collapse(void);
 
 // ---- A100 dispatch --------------------------------------------------------
 //

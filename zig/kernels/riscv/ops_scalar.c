@@ -79,6 +79,45 @@ void tf_riscv_rope_scalar(float *q, float *k, int pos, int q_heads, int kv_heads
     for (int h = 0; h < kv_heads; h++) rope_head(k + (size_t)h * head_dim, head_dim, pos, theta);
 }
 
+// Table + apply (the scalar oracle stays libm; the layout matches the RVV
+// family exactly so the families agree bit-for-bit in the tests).
+void tf_riscv_rope_table_scalar(int pos, float *s, float *c, int heads, int head_dim, float theta) {
+    const size_t half = (size_t)head_dim / 2;
+    for (int h = 0; h < heads; h++) {
+        double step = pow((double)theta, -2.0 / (double)head_dim);
+        double freq = 1.0;
+        for (size_t i = 0; i < half; i++) {
+            s[(size_t)h * half + i] = (float)sin((double)pos * freq);
+            c[(size_t)h * half + i] = (float)cos((double)pos * freq);
+            freq *= step;
+        }
+    }
+}
+
+void tf_riscv_rope_apply_scalar(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim) {
+    const size_t half = (size_t)head_dim / 2;
+    for (int h = 0; h < q_heads; h++) {
+        for (size_t i = 0; i < half; i++) {
+            const float a = q[(size_t)h * head_dim + i];
+            const float b = q[(size_t)h * head_dim + half + i];
+            const float cs = c[(size_t)h * half + i];
+            const float sn = s[(size_t)h * half + i];
+            q[(size_t)h * head_dim + i] = a * cs - b * sn;
+            q[(size_t)h * head_dim + half + i] = b * cs + a * sn;
+        }
+    }
+    for (int h = 0; h < kv_heads; h++) {
+        for (size_t i = 0; i < half; i++) {
+            const float a = k[(size_t)h * head_dim + i];
+            const float b = k[(size_t)h * head_dim + half + i];
+            const float cs = c[(size_t)h * half + i];
+            const float sn = s[(size_t)h * half + i];
+            k[(size_t)h * head_dim + i] = a * cs - b * sn;
+            k[(size_t)h * head_dim + half + i] = b * cs + a * sn;
+        }
+    }
+}
+
 void tf_riscv_softmax_scalar(float *x, int n) {
     float max = x[0];
     for (int i = 1; i < n; i++)

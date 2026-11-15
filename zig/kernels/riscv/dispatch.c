@@ -22,6 +22,8 @@ typedef struct {
     const char *name;
     void (*rmsnorm)(const float *, const float *, float *, int, float);
     void (*rope)(float *, float *, int, int, int, int, float);
+    void (*rope_table)(int, float *, float *, int, int, float);
+    void (*rope_apply)(float *, float *, const float *, const float *, int, int, int);
     void (*softmax)(float *, int);
     void (*silu_mul)(const float *, const float *, float *, int);
     void (*add)(const float *, const float *, float *, int);
@@ -38,6 +40,8 @@ typedef struct {
 
 void tf_riscv_rmsnorm_scalar(const float *x, const float *w, float *out, int n, float eps);
 void tf_riscv_rope_scalar(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta);
+void tf_riscv_rope_table_scalar(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_apply_scalar(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
 void tf_riscv_softmax_scalar(float *x, int n);
 void tf_riscv_silu_mul_scalar(const float *gate, const float *up, float *out, int n);
 void tf_riscv_add_scalar(const float *a, const float *b, float *out, int n);
@@ -55,6 +59,8 @@ static const tf_riscv_ops scalar_ops = {
     "scalar",
     tf_riscv_rmsnorm_scalar,
     tf_riscv_rope_scalar,
+    tf_riscv_rope_table_scalar,
+    tf_riscv_rope_apply_scalar,
     tf_riscv_softmax_scalar,
     tf_riscv_silu_mul_scalar,
     tf_riscv_add_scalar,
@@ -72,6 +78,8 @@ static const tf_riscv_ops scalar_ops = {
 #if defined(__riscv) && defined(__riscv_vector)
 void tf_riscv_rmsnorm_rvv(const float *x, const float *w, float *out, int n, float eps);
 void tf_riscv_rope_rvv(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta);
+void tf_riscv_rope_table_rvv(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_apply_rvv(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
 void tf_riscv_softmax_rvv(float *x, int n);
 void tf_riscv_silu_mul_rvv(const float *gate, const float *up, float *out, int n);
 void tf_riscv_add_rvv(const float *a, const float *b, float *out, int n);
@@ -89,6 +97,8 @@ static const tf_riscv_ops rvv_ops = {
     "rvv",
     tf_riscv_rmsnorm_rvv,
     tf_riscv_rope_rvv,
+    tf_riscv_rope_table_rvv,
+    tf_riscv_rope_apply_rvv,
     tf_riscv_softmax_rvv,
     tf_riscv_silu_mul_rvv,
     tf_riscv_add_rvv,
@@ -110,6 +120,8 @@ static const tf_riscv_ops rvv_ops = {
 int tf_riscv_ime2_available(void); // ime2.c: vendor runtime or emulated MMA present
 void tf_riscv_rmsnorm_ime2(const float *x, const float *w, float *out, int n, float eps);
 void tf_riscv_rope_ime2(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta);
+void tf_riscv_rope_table_ime2(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_apply_ime2(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
 void tf_riscv_softmax_ime2(float *x, int n);
 void tf_riscv_silu_mul_ime2(const float *gate, const float *up, float *out, int n);
 void tf_riscv_add_ime2(const float *a, const float *b, float *out, int n);
@@ -127,6 +139,8 @@ static const tf_riscv_ops ime2_ops = {
     "ime2",
     tf_riscv_rmsnorm_ime2,
     tf_riscv_rope_ime2,
+    tf_riscv_rope_table_ime2,
+    tf_riscv_rope_apply_ime2,
     tf_riscv_softmax_ime2,
     tf_riscv_silu_mul_ime2,
     tf_riscv_add_ime2,
@@ -246,6 +260,12 @@ __attribute__((constructor)) static void init(void) {
 void tf_riscv_rmsnorm(const float *x, const float *w, float *out, int n, float eps) { ops->rmsnorm(x, w, out, n, eps); }
 void tf_riscv_rope(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta) {
     ops->rope(q, k, pos, q_heads, kv_heads, head_dim, theta);
+}
+void tf_riscv_rope_table(int pos, float *s, float *c, int heads, int head_dim, float theta) {
+    ops->rope_table(pos, s, c, heads, head_dim, theta);
+}
+void tf_riscv_rope_apply(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim) {
+    ops->rope_apply(q, k, s, c, q_heads, kv_heads, head_dim);
 }
 void tf_riscv_softmax(float *x, int n) { ops->softmax(x, n); }
 void tf_riscv_silu_mul(const float *gate, const float *up, float *out, int n) { ops->silu_mul(gate, up, out, n); }

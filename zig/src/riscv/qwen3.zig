@@ -117,25 +117,30 @@ pub const Model = struct {
                 // quantized to int8 per 256-value group, so decode (one row)
                 // and prefill (m rows) run the same vmadot inner loop.
                 const raw: [*]const u8 = @ptrCast(@alignCast(w.mem.ptr));
-                const groups = w.cols / 256;
                 const pad = q4xActivation(w.cols, rows);
+                var t0 = nowNs();
                 c.tf_riscv_quant_a(x.ptr, pad.xa.ptr, pad.xs.ptr, @intCast(rows), @intCast(w.cols));
+                profAccum(profilePhaseForProject(), 1, t0);
+                t0 = nowNs();
                 if (rows == 1) {
                     if (pool.active() > 1) {
                         var ctx: GemvQ4xCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .raw = raw, .out = out.ptr, .n = w.rows, .k = w.cols };
                         pool.run(gemvQ4xShard, &ctx, w.rows);
+                        profAccum(profilePhaseForProject(), 6, t0);
                         return;
                     }
                     c.tf_riscv_gemv_q4x(pad.xa.ptr, pad.xs.ptr, raw, out.ptr, @intCast(w.rows), @intCast(w.cols));
+                    profAccum(profilePhaseForProject(), 6, t0);
                     return;
                 }
                 if (pool.active() > 1) {
                     var ctx: GemmQ4xCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .raw = raw, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols };
                     pool.run(gemmQ4xShard, &ctx, w.rows);
+                    profAccum(profilePhaseForProject(), 6, t0);
                     return;
                 }
                 c.tf_riscv_gemm_q4x_shard(pad.xa.ptr, pad.xs.ptr, raw, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 0, @intCast(w.rows));
-                _ = groups;
+                profAccum(profilePhaseForProject(), 6, t0);
             },
             .bf16 => {
                 if (pool.active() > 1) {
@@ -175,7 +180,13 @@ pub const Model = struct {
         _ = m;
         switch (w.kind) {
             .q8_0, .q4_0, .q4x => unreachable, // quantize() never touches the table
-            .f32 => @memcpy(out, w.f32Lanes()[row * w.cols ..][0..w.cols]),
+            .f32 => {
+                const src = w.f32Lanes()[row * w.cols ..][0..w.cols];
+                @memcpy(out, src);
+                if (qwen3_dump) {
+                    std.debug.print("TR row {d} src {*} dst {*} src0 {e} dst0 {e}\n", .{ row, src.ptr, out.ptr, src[0], out[0] });
+                }
+            },
             .bf16 => {
                 const lanes = w.bf16Lanes()[row * w.cols ..][0..w.cols];
                 for (lanes, out) |v, *o| o.* = @as(f32, @bitCast(@as(u32, v) << 16));
@@ -666,6 +677,55 @@ fn gemmQ4xShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
     c.tf_riscv_gemm_q4x_shard(p.xa, p.xs, p.raw, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), begin, end);
 }
 
+/// Decode fusion: several projections that share one activation run as a
+/// single sharded dispatch. The shard index range maps onto the sub-
+/// projections' output rows in order, so one pool run replaces N runs and
+/// the activation quantizes once for the whole set.
+const FusedProj = struct {
+    raw: [*]const u8,
+    out: [*]f32,
+    n: usize,
+};
+
+const FusedCtx = struct {
+    xa: [*]const i8,
+    xs: [*]const f32,
+    k: usize,
+    projs: []const FusedProj,
+};
+
+fn fusedShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
+    const f: *FusedCtx = @ptrCast(@alignCast(ctx.?));
+    const b: usize = @intCast(begin);
+    const e: usize = @intCast(end);
+    var base: usize = 0;
+    for (f.projs) |p| {
+        const lo = @max(b, base); // clamp: the shard range may start before
+        const hi = @min(e, base + p.n); // or end after this projection
+        if (hi > lo) {
+            const j0: c_int = @intCast(lo - base);
+            const j1: c_int = @intCast(hi - base);
+            c.tf_riscv_gemv_q4x_shard(f.xa, f.xs, p.raw, p.out, @intCast(p.n), @intCast(f.k), j0, j1);
+        }
+        base += p.n;
+    }
+}
+
+/// Decode: run `projs` projections over one activation in one dispatch.
+fn fusedProject(x: []const f32, k: usize, projs: []const FusedProj) void {
+    const pad = q4xActivation(k, 1);
+    c.tf_riscv_quant_a(x.ptr, pad.xa.ptr, pad.xs.ptr, 1, @intCast(k));
+    var total: usize = 0;
+    for (projs) |p| total += p.n;
+    if (pool.active() > 1) {
+        var ctx: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .projs = projs };
+        pool.run(fusedShard, &ctx, total);
+        return;
+    }
+    var f: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .projs = projs };
+    fusedShard(&f, 0, @intCast(total));
+}
+
 /// Module-level scratch for the quantized activation (int8 tiles plus the
 /// per-row group scales). One session per process, so it is never shared.
 const Activation = struct { xa: []i8, xs: []f32 };
@@ -714,6 +774,80 @@ fn projectShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
     }
 }
 
+// ---- phase profiling (TF_RISCV_PROFILE=1) ---------------------------------
+// Cumulated nanoseconds per phase, printed at each forward() return. The
+// categories are the ones the performance report's gap decomposition claims:
+// verify them, do not trust them. Phase 0 is the first (prefill) call, 1 all
+// decode calls after it.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+var profile_on: bool = false;
+var profile_calls: [2]u64 = .{ 0, 0 };
+var profile_ns: [2][8]u64 = .{ .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .{ 0, 0, 0, 0, 0, 0, 0, 0 } };
+var profile_aux: [2]u64 = .{ 0, 0 }; // projection calls counted
+
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+const Timespec = extern struct { tv_sec: isize, tv_nsec: isize };
+
+inline fn nowNs() u64 {
+    var ts: Timespec = .{ .tv_sec = 0, .tv_nsec = 0 };
+    _ = clock_gettime(1, &ts); // CLOCK_MONOTONIC
+    return @as(u64, @bitCast(ts.tv_sec)) *% 1_000_000_000 +% @as(u64, @bitCast(ts.tv_nsec));
+}
+
+inline fn profAccum(phase: usize, cat: usize, t0: u64) void {
+    if (profile_on) profile_ns[phase][cat] +%= nowNs() -% t0;
+}
+
+var profile_phase_now: usize = 0;
+
+pub var qwen3_dump = false;
+
+const FileC = opaque {};
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*FileC;
+extern "c" fn fwrite(ptr: *const anyopaque, size: usize, n: usize, f: *FileC) usize;
+extern "c" fn fclose(f: *FileC) c_int;
+
+fn dumpBytes(path: []const u8, xs: []const u8) void {
+    var z: [65:0]u8 = undefined;
+    if (path.len > 64) return;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const f = fopen(&z, "wb") orelse return;
+    _ = fwrite(xs.ptr, 1, xs.len, f);
+    _ = fclose(f);
+}
+
+fn dumpTensor(path: []const u8, xs: []const f32) void {
+    var z: [65:0]u8 = undefined;
+    if (path.len > 64) return;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const f = fopen(&z, "wb") orelse return;
+    _ = fwrite(xs.ptr, 4, xs.len, f);
+    _ = fclose(f);
+}
+
+/// Decode (session has tokens cached) or prefill, for the profiler.
+fn profilePhaseForProject() usize {
+    return profile_phase_now;
+}
+
+pub fn profileEnable() void {
+    profile_on = getenv("TF_RISCV_PROFILE") != null;
+}
+
+fn profPrint() void {
+    if (!profile_on) return;
+    const names = [8][]const u8{ "project(qkvo/gud)", "quant_a", "attention", "norms+rope+silu", "kv-cache-writes", "embed/head", "project-dispatch", "other" };
+    for (0..2) |ph| {
+        if (profile_calls[ph] == 0) continue;
+        const denom: f64 = @floatFromInt(profile_calls[ph]);
+        std.debug.print("PROFILE phase {d} calls {d}: ", .{ ph, profile_calls[ph] });
+        for (0..8) |cat| std.debug.print("{s}={d:.2}us ", .{ names[cat], @as(f64, @floatFromInt(profile_ns[ph][cat])) / denom / 1e3 });
+        std.debug.print("| proj_calls={d}\n", .{profile_aux[ph]});
+    }
+}
+
 /// One generation session: per-layer, per-KV-head caches the kernel
 /// attention reads as contiguous [rows, head_dim] panels.
 pub const Session = struct {
@@ -758,6 +892,9 @@ pub const Session = struct {
     /// ids through every layer; logits rows land in out (vocab per row).
     /// logits_all writes one row per input id, else only the last row.
     pub fn forward(s: *Session, ids: []const u32, out: []f32, logits_all: bool) !void {
+        const phase: usize = if (s.pos == 0) 0 else 1;
+        profile_calls[phase] += 1;
+        profile_phase_now = phase;
         const m = s.model;
         const spec = m.spec;
         if (ids.len == 0 or s.pos + ids.len > s.ctx) return error.ContextFull;
@@ -779,29 +916,52 @@ pub const Session = struct {
         const up = try a.alloc(f32, T * spec.inter);
         const act = try a.alloc(f32, T * spec.inter);
 
+        if (qwen3_dump) {
+            dumpTensor("embed-row.bin", m.embed.f32Lanes()[3 * spec.hidden ..][0..spec.hidden]);
+            const er = m.embed.f32Lanes();
+            std.debug.print("DUMP embed ptr {*} first4 {e} {e} {e} {e}\n", .{ m.embed.mem.ptr, er[768], er[769], er[770], er[771] });
+        }
         for (ids, 0..) |id, t| {
             if (id >= spec.vocab) return error.BadToken;
             m.tableRow(m.embed, id, x[t * spec.hidden ..][0..spec.hidden]);
         }
+        if (qwen3_dump) {
+            std.debug.print("DUMP x ptr {*} first4 {e} {e} {e} {e}\n", .{ x.ptr, x[0], x[1], x[2], x[3] });
+        }
 
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(spec.head_dim)));
         for (m.layers, 0..) |*l, li| {
-            for (0..T) |t| c.tf_riscv_rmsnorm(x[t * spec.hidden ..].ptr, l.input_norm.ptr, normed[t * spec.hidden ..].ptr, @intCast(spec.hidden), spec.eps);
+            var t = nowNs();
+            for (0..T) |t_| c.tf_riscv_rmsnorm(x[t_ * spec.hidden ..].ptr, l.input_norm.ptr, normed[t_ * spec.hidden ..].ptr, @intCast(spec.hidden), spec.eps);
+            if (qwen3_dump and li == 0 and s.pos == 0) {
+                dumpTensor("normed.bin", normed);
+                dumpTensor("x0.bin", x);
+            }
             m.project(l.q, normed, q, T);
+            if (qwen3_dump and li == 0 and s.pos == 0) {
+                dumpTensor("qout.bin", q);
+                dumpBytes("qweight.bin", l.q.mem);
+            }
             m.project(l.k, normed, k, T);
             m.project(l.v, normed, v, T);
-            for (0..T) |t| {
-                const pos: u32 = @intCast(s.pos + t);
-                for (0..spec.heads) |h| c.tf_riscv_rmsnorm(q[t * qw + h * spec.head_dim ..].ptr, l.q_norm.ptr, q[t * qw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim), spec.eps);
-                for (0..spec.kv_heads) |h| c.tf_riscv_rmsnorm(k[t * kvw + h * spec.head_dim ..].ptr, l.k_norm.ptr, k[t * kvw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim), spec.eps);
-                c.tf_riscv_rope(q[t * qw ..].ptr, k[t * kvw ..].ptr, @intCast(pos), @intCast(spec.heads), @intCast(spec.kv_heads), @intCast(spec.head_dim), spec.theta);
+            for (0..T) |t_| {
+                const pos: u32 = @intCast(s.pos + t_);
+                for (0..spec.heads) |h| c.tf_riscv_rmsnorm(q[t_ * qw + h * spec.head_dim ..].ptr, l.q_norm.ptr, q[t_ * qw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim), spec.eps);
+                for (0..spec.kv_heads) |h| c.tf_riscv_rmsnorm(k[t_ * kvw + h * spec.head_dim ..].ptr, l.k_norm.ptr, k[t_ * kvw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim), spec.eps);
+                c.tf_riscv_rope(q[t_ * qw ..].ptr, k[t_ * kvw ..].ptr, @intCast(pos), @intCast(spec.heads), @intCast(spec.kv_heads), @intCast(spec.head_dim), spec.theta);
+            }
+            profAccum(phase, 3, t);
+            t = nowNs();
+            for (0..T) |t_| {
                 for (0..spec.kv_heads) |h| {
+                    const pos: u32 = @intCast(s.pos + t_);
                     const dst_k = s.panel(s.k_cache, li, h)[pos * spec.head_dim ..][0..spec.head_dim];
                     const dst_v = s.panel(s.v_cache, li, h)[pos * spec.head_dim ..][0..spec.head_dim];
-                    @memcpy(dst_k, k[t * kvw + h * spec.head_dim ..][0..spec.head_dim]);
-                    @memcpy(dst_v, v[t * kvw + h * spec.head_dim ..][0..spec.head_dim]);
+                    @memcpy(dst_k, k[t_ * kvw + h * spec.head_dim ..][0..spec.head_dim]);
+                    @memcpy(dst_v, v[t_ * kvw + h * spec.head_dim ..][0..spec.head_dim]);
                 }
             }
+            profAccum(phase, 4, t);
             // Attention over the cache: sharded across heads when the pool is
             // up (each head is independent), one score row per head in the
             // session's scratch.
@@ -813,35 +973,59 @@ pub const Session = struct {
                 .T = T,
                 .scale = scale,
             };
+            t = nowNs();
             if (pool.active() > 1) {
                 pool.run(attnShard, &actx, spec.heads);
             } else {
                 attnShardRun(&actx, 0, @intCast(spec.heads));
             }
+            profAccum(phase, 2, t);
+            t = nowNs();
+            if (qwen3_dump and li == 0 and s.pos == 0) dumpTensor("attn-in.bin", attn);
             m.project(l.o, attn, o, T);
-            for (0..T) |t| c.tf_riscv_add(x[t * spec.hidden ..].ptr, o[t * spec.hidden ..].ptr, x[t * spec.hidden ..].ptr, @intCast(spec.hidden));
+            if (qwen3_dump and li == 0 and s.pos == 0) {
+                dumpTensor("o-out.bin", o);
+                dumpBytes("o-w.bin", l.o.mem);
+            }
+            for (0..T) |t_| c.tf_riscv_add(x[t_ * spec.hidden ..].ptr, o[t_ * spec.hidden ..].ptr, x[t_ * spec.hidden ..].ptr, @intCast(spec.hidden));
 
-            for (0..T) |t| c.tf_riscv_rmsnorm(x[t * spec.hidden ..].ptr, l.post_norm.ptr, normed[t * spec.hidden ..].ptr, @intCast(spec.hidden), spec.eps);
-            m.project(l.gate, normed, gate, T);
-            m.project(l.up, normed, up, T);
-            for (0..T) |t| c.tf_riscv_silu_mul(gate[t * spec.inter ..].ptr, up[t * spec.inter ..].ptr, act[t * spec.inter ..].ptr, @intCast(spec.inter));
+            for (0..T) |t_| c.tf_riscv_rmsnorm(x[t_ * spec.hidden ..].ptr, l.post_norm.ptr, normed[t_ * spec.hidden ..].ptr, @intCast(spec.hidden), spec.eps);
+            if (qwen3_dump and li == 0 and s.pos == 0) {
+                dumpTensor("gate-in.bin", normed);
+                dumpBytes("gate-w.bin", l.gate.mem);
+            }
+            if (T == 1 and l.gate.kind == .q4x) {
+                var projs: [2]FusedProj = undefined;
+                projs[0] = .{ .raw = @ptrCast(@alignCast(l.gate.mem.ptr)), .out = gate.ptr, .n = l.gate.rows };
+                projs[1] = .{ .raw = @ptrCast(@alignCast(l.up.mem.ptr)), .out = up.ptr, .n = l.up.rows };
+                fusedProject(normed, spec.hidden, &projs);
+            } else {
+                m.project(l.gate, normed, gate, T);
+                m.project(l.up, normed, up, T);
+            }
+            if (qwen3_dump and li == 0 and s.pos == 0) dumpTensor("gate-out.bin", gate);
+            for (0..T) |t_| c.tf_riscv_silu_mul(gate[t_ * spec.inter ..].ptr, up[t_ * spec.inter ..].ptr, act[t_ * spec.inter ..].ptr, @intCast(spec.inter));
             m.project(l.down, act, o, T);
-            for (0..T) |t| c.tf_riscv_add(x[t * spec.hidden ..].ptr, o[t * spec.hidden ..].ptr, x[t * spec.hidden ..].ptr, @intCast(spec.hidden));
+            for (0..T) |t_| c.tf_riscv_add(x[t_ * spec.hidden ..].ptr, o[t_ * spec.hidden ..].ptr, x[t_ * spec.hidden ..].ptr, @intCast(spec.hidden));
+            profAccum(phase, 0, t);
         }
 
         // Final norm and the head, on every row or just the chunk's last.
+        const t = nowNs();
         const rows_out: usize = if (logits_all) T else 1;
-        for (0..rows_out) |t| {
-            const src = if (logits_all) t else T - 1;
+        for (0..rows_out) |t_| {
+            const src = if (logits_all) t_ else T - 1;
             const h = try a.alloc(f32, spec.hidden);
             c.tf_riscv_rmsnorm(x[src * spec.hidden ..].ptr, m.final_norm.ptr, h.ptr, @intCast(spec.hidden), spec.eps);
-            m.project(m.head, h, out[t * spec.vocab ..][0..spec.vocab], 1);
+            m.project(m.head, h, out[t_ * spec.vocab ..][0..spec.vocab], 1);
         }
+        profAccum(phase, 5, t);
         s.pos += T;
+        profPrint();
     }
 };
 
-/// Greedy or sampled pick from one logits row.
+/// Greedy or sampled pick from one logits row./// Greedy or sampled pick from one logits row.
 pub fn sampleOne(logits: []const f32, temperature: f32, top_p: f32, rng: std.Random) u32 {
     if (temperature <= 0) {
         var best: usize = 0;

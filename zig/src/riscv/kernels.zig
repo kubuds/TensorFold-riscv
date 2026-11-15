@@ -12,6 +12,8 @@ pub const c = struct {
 
     pub extern "C" fn tf_riscv_rmsnorm(x: [*]const f32, w: ?[*]const f32, out: [*]f32, n: c_int, eps: f32) void;
     pub extern "C" fn tf_riscv_rope(q: [*]f32, k: [*]f32, pos: c_int, q_heads: c_int, kv_heads: c_int, head_dim: c_int, theta: f32) void;
+    pub extern "C" fn tf_riscv_rope_table(pos: c_int, s: [*]f32, c_: [*]f32, heads: c_int, head_dim: c_int, theta: f32) void;
+    pub extern "C" fn tf_riscv_rope_apply(q: [*]f32, k: [*]f32, s: [*]const f32, c_: [*]const f32, q_heads: c_int, kv_heads: c_int, head_dim: c_int) void;
     pub extern "C" fn tf_riscv_softmax(x: [*]f32, n: c_int) void;
     pub extern "C" fn tf_riscv_silu_mul(gate: [*]const f32, up: [*]const f32, out: [*]f32, n: c_int) void;
     pub extern "C" fn tf_riscv_add(a: [*]const f32, b: [*]const f32, out: [*]f32, n: c_int) void;
@@ -48,6 +50,7 @@ pub const c = struct {
     pub extern "C" fn tf_riscv_hpage_available() c_int;
     pub extern "C" fn tf_riscv_hpage_backed(p: ?*const anyopaque) usize;
     pub extern "C" fn tf_riscv_hpage_bytes() usize;
+    pub extern "C" fn tf_riscv_hpage_collapse() usize;
 };
 
 pub const Cap = struct {

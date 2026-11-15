@@ -111,3 +111,29 @@ size_t tf_riscv_hpage_backed(const void *p) {
 }
 
 size_t tf_riscv_hpage_bytes(void) { return hpage_total; }
+
+// Synchronously collapse the arena's eligible pages into transparent huge
+// pages (MADV_COLLAPSE, Linux 6.1+). MADV_HUGEPAGE only marks the VMA for
+// khugepaged, which on the K3 had not promoted a 3.4 GiB arena by the time
+// the first bench run started (hpage_backed read 0); the synchronous collapse
+// makes --mem hpage mean what the vendor's mem_backend=HPAGE means. Returns
+// the number of collapsed bytes, 0 when the kernel does not support it.
+size_t tf_riscv_hpage_collapse(void) {
+#if defined(__linux__) && defined(MADV_COLLAPSE)
+    size_t total = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long a = 0, b = 0;
+        if (sscanf(line, "%llx-%llx", &a, &b) != 2) continue;
+        void *p = (void *)(uintptr_t)a;
+        size_t len = (size_t)(b - a);
+        if (madvise(p, len, MADV_COLLAPSE) == 0) total += len;
+    }
+    fclose(f);
+    return total;
+#else
+    return 0;
+#endif
+}

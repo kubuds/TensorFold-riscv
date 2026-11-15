@@ -87,16 +87,15 @@ void tf_riscv_gemv_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
     const int groups = k / Q4X_GROUP;
     const size_t stride = tf_riscv_q4x_block_bytes(k);
     const size_t v8 = __riscv_vsetvl_e32m1(Q4X_ROWS);
-    // The tile's TCM holds the quantized activation row (8-row vmadot tile,
-    // padded) and the int32 read-back buffer: software-managed local memory
-    // for the data the loop re-reads on every weight tile.
+    // Stage the activation row in the tile's TCM (one 8 KiB copy per pass,
+    // then every weight tile reads its A operands from local SRAM; measured
+    // 12.7 -> 15.4 GB/s on the lm_head shape).
     const size_t a_bytes = (size_t)Q4X_ROWS * k;
     int8_t *atcm = (int8_t *)tf_riscv_scratch(a_bytes);
-    int32_t *iacc_tcm = (int32_t *)tf_riscv_scratch(64 * sizeof(int32_t));
     if (atcm) memcpy(atcm, xa, a_bytes);
     const int8_t *xa_d = atcm ? atcm : xa;
     int32_t iacc_stack[64] __attribute__((aligned(64)));
-    int32_t *iacc = iacc_tcm ? iacc_tcm : iacc_stack;
+    int32_t *iacc = iacc_stack;
     for (int jb = j0; jb < j1; jb += Q4X_ROWS) {
         int cols = j1 - jb;
         if (cols > Q4X_ROWS) cols = Q4X_ROWS;
@@ -289,15 +288,15 @@ void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
                 float dw[Q4X_ROWS];
                 const uint16_t *sc = (const uint16_t *)(block + (size_t)g * Q4X_ROWS * 2);
                 for (int r = 0; r < Q4X_ROWS; r++) dw[r] = half_to_f32(sc[r]);
+                // The 64-lane weight-scale vector repeats dw every 8 lanes;
+                // build it once per group instead of 64 scalar stores per
+                // block (the previous inner loop was most of the epilogue).
+                float dw64[64] __attribute__((aligned(64)));
+                for (int r = 0; r < 64; r++) dw64[r] = dw[r & 7];
+                vfloat32m2_t wv = __riscv_vle32_v_f32m2(dw64, v64);
                 for (int b = 0; b < GEMM_BLOCKS; b++) {
                     vfloat32m2_t fv = __riscv_vfcvt_f_x_v_f32m2(__riscv_vle32_v_i32m2(iacc[b], v64), v64);
                     vfloat32m2_t fa = __riscv_vle32_v_f32m2(facc[b], v64);
-                    // 64 lanes: 8 activation rows x 8 output rows, so the
-                    // weight scale repeats eight times per lane group and the
-                    // activation scale is constant per group of 8 lanes.
-                    float sc64[64] __attribute__((aligned(64)));
-                    for (int t = 0; t < 64; t++) sc64[t] = dw[t % Q4X_ROWS];
-                    vfloat32m2_t wv = __riscv_vle32_v_f32m2(sc64, v64);
                     fv = __riscv_vfmul_vv_f32m2(fv, wv, v64);
                     fa = __riscv_vfmacc_vf_f32m2(fa, xs[(size_t)(m0 / Q4X_ROWS + b) * groups + g], fv, v64);
                     __riscv_vse32_v_f32m2(facc[b], fa, v64);

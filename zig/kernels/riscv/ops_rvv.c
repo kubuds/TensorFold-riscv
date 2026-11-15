@@ -274,36 +274,123 @@ void tf_riscv_rmsnorm_rvv(const float *x, const float *w, float *out, int n, flo
     }
 }
 
-// rotate_half over one head: freq[i] via one powf and a recurrence, cos/sin
-// per element (libm), the rotate itself on vectors (ledger: cos/sin tables).
-static inline void rope_head_rvv(float *h, int head_dim, int pos, float theta) {
+// The per-position (sin, cos) table, built once per token. The angles are
+// reduced in double (a float-only reduction costs 2e-4 at pos 4096, measured
+// as rope drift on the K3), the polynomials run as f32 vectors, and the
+// quadrant choice is a vector merge. Same math as fast_sincosf modulo f32
+// polynomial rounding (~1e-7, inside the family tolerance).
+void tf_riscv_rope_table_rvv(int pos, float *s, float *c, int heads, int head_dim, float theta) {
     const size_t half = (size_t)head_dim / 2;
-    const double step = pow((double)theta, -2.0 / (double)head_dim); // double:
-    double freq = 1.0; // the recurrence keeps |freq error| under i * 2^-53
-    size_t i = 0, vl;
-    while (i < half) {
-        vl = __riscv_vsetvl_e32m4(half - i);
-        float cbuf[32], sbuf[32];
-        if (vl > 32) vl = 32;
-        for (size_t j = 0; j < vl; j++) {
-            fast_sincosf((double)pos * freq, &sbuf[j], &cbuf[j]);
-            freq *= step;
+    const double step = pow((double)theta, -2.0 / (double)head_dim);
+    const double two_over_pi = 2.0 / 3.14159265358979323846;
+    const double half_pi = 1.5707963267948966;
+    for (int h = 0; h < heads; h++) {
+        double freq = 1.0;
+        float *sp = s + (size_t)h * half;
+        float *cp = c + (size_t)h * half;
+        size_t i = 0;
+        while (i < half) {
+            size_t vl = __riscv_vsetvl_e32m4(half - i);
+            float rbuf[32], qbuf[32];
+            if (vl > 32) vl = 32;
+            for (size_t j = 0; j < vl; j++) {
+                const double angle = (double)pos * freq;
+                const double k4 = round(angle * two_over_pi);
+                rbuf[j] = (float)(angle - k4 * half_pi);
+                qbuf[j] = (float)((long)k4 & 3);
+                freq *= step;
+            }
+            vfloat32m4_t r = __riscv_vle32_v_f32m4(rbuf, vl);
+            vfloat32m4_t r2 = __riscv_vfmul_vv_f32m4(r, r, vl);
+            const float c1 = 1.0f, c2 = -1.0f / 6.0f, c3 = 1.0f / 120.0f, c4 = -1.0f / 5040.0f, c5 = 1.0f / 362880.0f;
+            const float d1 = 1.0f, d2 = -1.0f / 2.0f, d3 = 1.0f / 24.0f, d4 = -1.0f / 720.0f, d5 = 1.0f / 40320.0f;
+            // Horner: each step is prev*r2 + coeff, i.e. vfmadd_vv with the
+            // coefficient broadcast as a vector (the _vf variant adds instead
+            // of multiplying the accumulated value).
+            vfloat32m4_t spoly = __riscv_vfmv_v_f_f32m4(c5, vl);
+            spoly = __riscv_vfmadd_vv_f32m4(spoly, r2, __riscv_vfmv_v_f_f32m4(c4, vl), vl);
+            spoly = __riscv_vfmadd_vv_f32m4(spoly, r2, __riscv_vfmv_v_f_f32m4(c3, vl), vl);
+            spoly = __riscv_vfmadd_vv_f32m4(spoly, r2, __riscv_vfmv_v_f_f32m4(c2, vl), vl);
+            spoly = __riscv_vfmadd_vv_f32m4(spoly, r2, __riscv_vfmv_v_f_f32m4(c1, vl), vl);
+            spoly = __riscv_vfmul_vv_f32m4(spoly, r, vl);
+            vfloat32m4_t cpoly = __riscv_vfmv_v_f_f32m4(d5, vl);
+            cpoly = __riscv_vfmadd_vv_f32m4(cpoly, r2, __riscv_vfmv_v_f_f32m4(d4, vl), vl);
+            cpoly = __riscv_vfmadd_vv_f32m4(cpoly, r2, __riscv_vfmv_v_f_f32m4(d3, vl), vl);
+            cpoly = __riscv_vfmadd_vv_f32m4(cpoly, r2, __riscv_vfmv_v_f_f32m4(d2, vl), vl);
+            cpoly = __riscv_vfmadd_vv_f32m4(cpoly, r2, __riscv_vfmv_v_f_f32m4(d1, vl), vl);
+            vfloat32m4_t qv = __riscv_vle32_v_f32m4(qbuf, vl);
+            vbool8_t q0 = __riscv_vmfeq_vf_f32m4_b8(qv, 0.0f, vl);
+            vbool8_t q1 = __riscv_vmfeq_vf_f32m4_b8(qv, 1.0f, vl);
+            vbool8_t q2 = __riscv_vmfeq_vf_f32m4_b8(qv, 2.0f, vl);
+            vbool8_t q3 = __riscv_vmfeq_vf_f32m4_b8(qv, 3.0f, vl);
+            // vmerge_vvm(false_val, true_val, mask): mask selects the SECOND
+            // operand (probed on the K3: all-true mask returns op2).
+            vfloat32m4_t negsp = __riscv_vfneg_v_f32m4(spoly, vl);
+            vfloat32m4_t negcp = __riscv_vfneg_v_f32m4(cpoly, vl);
+            vfloat32m4_t sn = spoly;
+            sn = __riscv_vmerge_vvm_f32m4(sn, cpoly, q1, vl);
+            sn = __riscv_vmerge_vvm_f32m4(sn, negsp, q2, vl);
+            sn = __riscv_vmerge_vvm_f32m4(sn, negcp, q3, vl);
+            vfloat32m4_t cs = cpoly;
+            cs = __riscv_vmerge_vvm_f32m4(cs, negsp, q1, vl);
+            cs = __riscv_vmerge_vvm_f32m4(cs, negcp, q2, vl);
+            cs = __riscv_vmerge_vvm_f32m4(cs, spoly, q3, vl);
+            __riscv_vse32_v_f32m4(sp + i, sn, vl);
+            __riscv_vse32_v_f32m4(cp + i, cs, vl);
+            i += vl;
         }
-        vfloat32m4_t va = __riscv_vle32_v_f32m4(h + i, vl);
-        vfloat32m4_t vb = __riscv_vle32_v_f32m4(h + half + i, vl);
-        vfloat32m4_t vc = __riscv_vle32_v_f32m4(cbuf, vl);
-        vfloat32m4_t vs = __riscv_vle32_v_f32m4(sbuf, vl);
-        vfloat32m4_t oa = __riscv_vfnmsac_vv_f32m4(__riscv_vfmul_vv_f32m4(va, vc, vl), vb, vs, vl); // a*c - b*s
-        vfloat32m4_t ob = __riscv_vfmacc_vv_f32m4(__riscv_vfmul_vv_f32m4(vb, vc, vl), va, vs, vl);  // b*c + a*s
-        __riscv_vse32_v_f32m4(h + i, oa, vl);
-        __riscv_vse32_v_f32m4(h + half + i, ob, vl);
-        i += vl;
     }
 }
 
+// Apply the precomputed table: pure vector rotation, no transcendentals.
+void tf_riscv_rope_apply_rvv(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim) {
+    const size_t half = (size_t)head_dim / 2;
+    for (int h = 0; h < q_heads; h++) {
+        float *hh = q + (size_t)h * head_dim;
+        const float *sp = s + (size_t)h * half;
+        const float *cp = c + (size_t)h * half;
+        size_t i = 0;
+        while (i < half) {
+            size_t vl = __riscv_vsetvl_e32m4(half - i);
+            vfloat32m4_t va = __riscv_vle32_v_f32m4(hh + i, vl);
+            vfloat32m4_t vb = __riscv_vle32_v_f32m4(hh + half + i, vl);
+            vfloat32m4_t vc = __riscv_vle32_v_f32m4(cp + i, vl);
+            vfloat32m4_t vs = __riscv_vle32_v_f32m4(sp + i, vl);
+            vfloat32m4_t oa = __riscv_vfnmsac_vv_f32m4(__riscv_vfmul_vv_f32m4(va, vc, vl), vb, vs, vl);
+            vfloat32m4_t ob = __riscv_vfmacc_vv_f32m4(__riscv_vfmul_vv_f32m4(vb, vc, vl), va, vs, vl);
+            __riscv_vse32_v_f32m4(hh + i, oa, vl);
+            __riscv_vse32_v_f32m4(hh + half + i, ob, vl);
+            i += vl;
+        }
+    }
+    for (int h = 0; h < kv_heads; h++) {
+        float *hh = k + (size_t)h * head_dim;
+        const float *sp = s + (size_t)h * half;
+        const float *cp = c + (size_t)h * half;
+        size_t i = 0;
+        while (i < half) {
+            size_t vl = __riscv_vsetvl_e32m4(half - i);
+            vfloat32m4_t va = __riscv_vle32_v_f32m4(hh + i, vl);
+            vfloat32m4_t vb = __riscv_vle32_v_f32m4(hh + half + i, vl);
+            vfloat32m4_t vc = __riscv_vle32_v_f32m4(cp + i, vl);
+            vfloat32m4_t vs = __riscv_vle32_v_f32m4(sp + i, vl);
+            vfloat32m4_t oa = __riscv_vfnmsac_vv_f32m4(__riscv_vfmul_vv_f32m4(va, vc, vl), vb, vs, vl);
+            vfloat32m4_t ob = __riscv_vfmacc_vv_f32m4(__riscv_vfmul_vv_f32m4(vb, vc, vl), va, vs, vl);
+            __riscv_vse32_v_f32m4(hh + i, oa, vl);
+            __riscv_vse32_v_f32m4(hh + half + i, ob, vl);
+            i += vl;
+        }
+    }
+}
+
+// The combined entry keeps the old signature for the tests: table + apply.
 void tf_riscv_rope_rvv(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta) {
-    for (int h = 0; h < q_heads; h++) rope_head_rvv(q + (size_t)h * head_dim, head_dim, pos, theta);
-    for (int h = 0; h < kv_heads; h++) rope_head_rvv(k + (size_t)h * head_dim, head_dim, pos, theta);
+    const int heads = q_heads > kv_heads ? q_heads : kv_heads;
+    const size_t half = (size_t)head_dim / 2;
+    float *sbuf = (float *)tf_riscv_scratch((size_t)heads * half * 2 * sizeof(float));
+    float *cbuf = sbuf + (size_t)heads * half;
+    tf_riscv_rope_table_rvv(pos, sbuf, cbuf, heads, head_dim, theta);
+    tf_riscv_rope_apply_rvv(q, k, sbuf, cbuf, q_heads, kv_heads, head_dim);
 }
 
 void tf_riscv_softmax_rvv(float *x, int n) {

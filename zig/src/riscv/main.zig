@@ -45,6 +45,8 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
+    qwen3.profileEnable();
+    qwen3.qwen3_dump = getEnv("TF_RISCV_DUMP") != null;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const out = std.Io.File.stdout();
 
@@ -214,6 +216,11 @@ fn writeReport(init: std.process.Init, path: ?[]const u8, body: []const u8) !voi
 pub var hpage_weights = true;
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+fn getEnv(name: [*:0]const u8) ?[*:0]const u8 {
+    return getenv(name);
+}
 
 /// Load-time weight quantization: --quant none|q8_0|q4_0|q4x.
 fn setQuant(v: ?[]const u8) void {
@@ -255,6 +262,10 @@ fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]
 
     var model = qwen3.Model.load(gpa, init.io, common.model) catch |err| fail("cannot load {s}: {s}", .{ common.model, @errorName(err) });
     defer model.deinit();
+    if (hpage_weights) {
+        const collapsed = hpage.collapse();
+        if (collapsed > 0) std.debug.print("tensorfold-riscv: collapsed {d} MiB of the weight arena into huge pages\n", .{collapsed >> 20});
+    }
 
     const tok_path = try std.fmt.allocPrint(gpa, "{s}/tokenizer.json", .{common.model});
     defer gpa.free(tok_path);
@@ -354,6 +365,10 @@ fn benchCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:
 
     var model = qwen3.Model.load(gpa, init.io, common.model) catch |err| fail("cannot load {s}: {s}", .{ common.model, @errorName(err) });
     defer model.deinit();
+    if (hpage_weights) {
+        const collapsed = hpage.collapse();
+        if (collapsed > 0) std.debug.print("tensorfold-riscv: collapsed {d} MiB of the weight arena into huge pages\n", .{collapsed >> 20});
+    }
 
     // Seeded random ids in the model's vocabulary: the same workload on every
     // machine and kernel family, no tokenizer needed.

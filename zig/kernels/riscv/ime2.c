@@ -33,6 +33,8 @@
 // The RVV family this file forwards to (ops_rvv.c, same -mcpu).
 void tf_riscv_rmsnorm_rvv(const float *x, const float *w, float *out, int n, float eps);
 void tf_riscv_rope_rvv(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta);
+void tf_riscv_rope_table_rvv(int pos, float *s, float *c, int heads, int head_dim, float theta);
+void tf_riscv_rope_apply_rvv(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim);
 void tf_riscv_softmax_rvv(float *x, int n);
 void tf_riscv_silu_mul_rvv(const float *gate, const float *up, float *out, int n);
 void tf_riscv_add_rvv(const float *a, const float *b, float *out, int n);
@@ -135,6 +137,12 @@ int tf_riscv_ime2_available(void) {
 void tf_riscv_rmsnorm_ime2(const float *x, const float *w, float *out, int n, float eps) { tf_riscv_rmsnorm_rvv(x, w, out, n, eps); }
 void tf_riscv_rope_ime2(float *q, float *k, int pos, int q_heads, int kv_heads, int head_dim, float theta) {
     tf_riscv_rope_rvv(q, k, pos, q_heads, kv_heads, head_dim, theta);
+}
+void tf_riscv_rope_table_ime2(int pos, float *s, float *c, int heads, int head_dim, float theta) {
+    tf_riscv_rope_table_rvv(pos, s, c, heads, head_dim, theta);
+}
+void tf_riscv_rope_apply_ime2(float *q, float *k, const float *s, const float *c, int q_heads, int kv_heads, int head_dim) {
+    tf_riscv_rope_apply_rvv(q, k, s, c, q_heads, kv_heads, head_dim);
 }
 void tf_riscv_softmax_ime2(float *x, int n) { tf_riscv_softmax_rvv(x, n); }
 void tf_riscv_silu_mul_ime2(const float *gate, const float *up, float *out, int n) { tf_riscv_silu_mul_rvv(gate, up, out, n); }

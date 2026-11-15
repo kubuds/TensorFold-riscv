@@ -190,12 +190,17 @@ void tf_riscv_quant_a_rvv(const float *x, int8_t *xa, float *xs, int m, int k) {
         for (int g = 0; g < groups; g++) {
             const float *src = x + (size_t)i * k + g * Q4X_GROUP;
             float amax = 0.0f;
-            for (int j = 0; j < Q4X_GROUP; j += 64) {
+            // The stride must follow vl: at VLEN=256 e32m4 is 32 lanes, and a
+            // fixed 64-step sampled only half the group (the group scale then
+            // differed from the scalar oracle whenever the max sat in the
+            // skipped half).
+            for (int j = 0; j < Q4X_GROUP;) {
                 size_t vl = __riscv_vsetvl_e32m4((size_t)(Q4X_GROUP - j));
                 vfloat32m4_t v = __riscv_vfabs_v_f32m4(__riscv_vle32_v_f32m4(src + j, vl), vl);
                 vfloat32m1_t z = __riscv_vfmv_v_f_f32m1(0.0f, __riscv_vsetvlmax_e32m1());
                 vfloat32m1_t mx = __riscv_vfredmax_vs_f32m4_f32m1(v, z, vl);
                 amax = fmaxf(amax, __riscv_vfmv_f_s_f32m1_f32(mx));
+                j += (int)vl;
             }
             const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
             const float inv = d > 0.0f ? 1.0f / d : 0.0f;
@@ -204,13 +209,19 @@ void tf_riscv_quant_a_rvv(const float *x, int8_t *xa, float *xs, int m, int k) {
                 const int kc = g * (Q4X_GROUP / 16) + c;
                 int8_t *tile = (int8_t *)q4x_a_tile(xa, i, k, kc);
                 const float *p = src + c * 16;
-                size_t vl = __riscv_vsetvl_e32m1(16);
-                vfloat32m1_t v = __riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(p, vl), inv, vl);
-                vint32m1_t iv = __riscv_vfcvt_x_f_v_i32m1(v, vl);
-                iv = __riscv_vmax_vx_i32m1(iv, -127, vl);
-                iv = __riscv_vmin_vx_i32m1(iv, 127, vl);
-                vint16mf2_t mid = __riscv_vncvt_x_x_w_i16mf2(iv, vl);
-                __riscv_vse8_v_i8mf4(tile, __riscv_vncvt_x_x_w_i8mf4(mid, vl), vl);
+                // Narrowing needs the source register group to be twice the
+                // destination LMUL, so the whole 16-lane chunk runs at m2:
+                // i32m2 (16 lanes at VLEN=256) -> i16m1 -> i8mf2. The old
+                // i32m1/mf4 chain only stored 8 bytes per chunk at VLEN=256:
+                // the half-zero activation that made the X100 quant differ
+                // from the scalar oracle.
+                size_t vl = __riscv_vsetvl_e32m2(16);
+                vfloat32m2_t v = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p, vl), inv, vl);
+                vint32m2_t iv = __riscv_vfcvt_x_f_v_i32m2(v, vl);
+                iv = __riscv_vmax_vx_i32m2(iv, -127, vl);
+                iv = __riscv_vmin_vx_i32m2(iv, 127, vl);
+                vint16m1_t mid = __riscv_vncvt_x_x_w_i16m1(iv, vl);
+                __riscv_vse8_v_i8mf2(tile, __riscv_vncvt_x_x_w_i8mf2(mid, vl), vl);
             }
         }
     }
@@ -310,10 +321,7 @@ static int q4x_ime2(void) {
 
 void tf_riscv_quant_a(const float *x, int8_t *xa, float *xs, int m, int k) {
 #if defined(__riscv) && defined(__riscv_vector)
-    // The scalar form is the reference: the quantizer runs once per
-    // projection over the activation row (a few KB), so its cost is noise
-    // next to the weight streams and one implementation cannot drift.
-    if (0) {
+    if (!q4x_scalar()) {
         tf_riscv_quant_a_rvv(x, xa, xs, m, k);
         return;
     }

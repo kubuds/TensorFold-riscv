@@ -17,8 +17,19 @@ const kernels = @import("kernels.zig");
 
 const c = kernels.c;
 
+// Linux anonymous memory, used directly so the arena's mappings can be
+// 2 MiB-aligned: transparent huge pages (the whole point of this file) need
+// the mapping to start on a PMD boundary, and plain mmap only promises 4 KiB.
+extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
+extern "c" fn madvise(addr: *anyopaque, len: usize, advice: c_int) c_int;
+const PROT_READ_WRITE: c_int = 3;
+const MAP_PRIVATE_ANON: c_int = 0x22;
+const MADV_HUGEPAGE: c_int = 14;
+const MADV_DONTNEED: c_int = 4;
+
 pub const HpageAllocator = struct {
-    const Entry = struct { ptr: [*]u8, len: usize };
+    const Entry = struct { ptr: [*]u8, raw: [*]u8, len: usize, raw_len: usize };
     const max_entries = 64;
 
     entries: [max_entries]Entry = undefined,
@@ -38,23 +49,29 @@ pub const HpageAllocator = struct {
         const need = @max(len, 1);
         const size = (need + page - 1) & ~@as(usize, page - 1);
         if (self.count < max_entries) {
-            if (c.tf_riscv_hpage_alloc(size)) |raw| {
-                const p: [*]u8 = @ptrCast(raw);
-                std.debug.assert(@intFromPtr(p) % alignment.toByteUnits() == 0);
-                self.entries[self.count] = .{ .ptr = p, .len = size };
-                self.count += 1;
-                self.bytes += size;
-                return p;
-            }
+            // Over-map by one huge page and align the handed-out pointer to a
+            // 2 MiB boundary: MADV_COLLAPSE needs whole PMDs, and per-tensor
+            // mappings that start on 4 KiB boundaries get zero of them.
+            const raw = mmap(null, size + page, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0) orelse {
+                self.fallback = true;
+                const pad = alignment.toByteUnits();
+                const raw = std.heap.page_allocator.alignedAlloc(u8, .of(usize), need + pad) catch return null;
+                return @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(raw.ptr), pad));
+            };
+            const aligned = std.mem.alignForward(usize, @intFromPtr(raw), page);
+            const p: [*]u8 = @ptrFromInt(aligned);
+            if (aligned != @intFromPtr(raw)) _ = madvise(raw, aligned - @intFromPtr(raw), MADV_DONTNEED);
+            _ = madvise(p, size, MADV_HUGEPAGE);
+            self.entries[self.count] = .{ .ptr = p, .raw = @ptrCast(raw), .len = size, .raw_len = size + page };
+            self.count += 1;
+            self.bytes += size;
+            return p;
         }
         // No THP arena (or too many chunks): plain page_allocator memory.
         self.fallback = true;
-        // Alignment here is a runtime value; page_allocator's alignedAlloc
-        // wants it comptime-known, so over-allocate and align by hand.
         const pad = alignment.toByteUnits();
         const raw = std.heap.page_allocator.alignedAlloc(u8, .of(usize), need + pad) catch return null;
-        const aligned = std.mem.alignForward(usize, @intFromPtr(raw.ptr), pad);
-        return @ptrFromInt(aligned);
+        return @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(raw.ptr), pad));
     }
 
     fn resize(ctx: *anyopaque, buf: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
@@ -73,7 +90,7 @@ pub const HpageAllocator = struct {
         const self: *HpageAllocator = @ptrCast(@alignCast(ctx));
         for (self.entries[0..self.count]) |e| {
             if (e.ptr == buf.ptr) {
-                c.tf_riscv_hpage_free(@ptrCast(e.ptr), e.len);
+                _ = munmap(e.raw, e.raw_len);
                 self.bytes -= e.len;
                 return;
             }
@@ -111,4 +128,10 @@ pub fn backed() usize {
 
 pub fn available() bool {
     return c.tf_riscv_hpage_available() != 0;
+}
+
+/// Collapse the mapped arena into transparent huge pages now, instead of
+/// waiting for khugepaged (--mem hpage).
+pub fn collapse() usize {
+    return c.tf_riscv_hpage_collapse();
 }
