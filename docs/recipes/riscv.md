@@ -45,8 +45,12 @@ Serve and measure:
 ```sh
 tensorfold-riscv caps
 tensorfold-riscv run MODEL --prompt "..." --max-tokens 128 --report run.json
-tensorfold-riscv bench MODEL --prefill 512 --decode 128 --cpus 8-15 --report bench.json
+tensorfold-riscv bench MODEL --prefill 512 --decode 128 --cpus 0-7 --report bench.json
 ```
+
+`--quant q8_0|q4_0` quantizes the projections at load (GGUF q8_0/q4_0
+blocks, f16 scales); measured on K3 the q8_0 path is the fastest decode
+(11.7 tok/s, see the performance report).
 
 `--cpus LIST` pins the process (K3: `0-7` X100, `8-15` A100); `--threads N`
 sets OpenBLAS workers; `--kernels scalar|rvv|ime2` forces a family;
