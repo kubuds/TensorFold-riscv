@@ -17,9 +17,13 @@ pub const c = struct {
     pub extern "C" fn tf_riscv_add(a: [*]const f32, b: [*]const f32, out: [*]f32, n: c_int) void;
     pub extern "C" fn tf_riscv_matmul_f32(a: [*]const f32, b: [*]const f32, out: [*]f32, m: c_int, n: c_int, k: c_int, trans_b: c_int) void;
     pub extern "C" fn tf_riscv_matmul_bf16(x: [*]const f32, w: [*]const u16, out: [*]f32, m: c_int, n: c_int, k: c_int) void;
-    pub extern "C" fn tf_riscv_attention_f32(q: [*]const f32, k: [*]const f32, v: [*]const f32, out: [*]f32, rows: c_int, head_dim: c_int, scale: f32) void;
+    pub extern "C" fn tf_riscv_matmul_bf16_shard(x: [*]const f32, w: [*]const u16, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_matmul_f32_shard(a: [*]const f32, b: [*]const f32, out: [*]f32, m: c_int, n: c_int, k: c_int, trans_b: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_attention_f32(q: [*]const f32, k: [*]const f32, v: [*]const f32, out: [*]f32, rows: c_int, head_dim: c_int, scale: f32, scratch: [*]f32) void;
     pub extern "C" fn tf_riscv_gemv_q8_0(x: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
     pub extern "C" fn tf_riscv_gemv_q4_0(x: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
+    pub extern "C" fn tf_riscv_matmul_q8_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_matmul_q4_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
 };
 
 pub const Cap = struct {

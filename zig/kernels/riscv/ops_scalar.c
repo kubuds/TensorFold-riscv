@@ -127,73 +127,160 @@ void tf_riscv_matmul_bf16_scalar(const float *x, const uint16_t *w, float *out, 
     }
 }
 
-void tf_riscv_attention_f32_scalar(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale) {
-    // Scores in a caller-provided window would bound memory; this baseline keeps
-    // one VLA-free pass with two loops over the cache instead (no allocation).
+// Weight rows reused across a 64-row output block: prefill reads each weight
+// row ceil(m/64) times instead of m times (the m>1 weight-traffic fix).
+#define TF_RISCV_ROW_BLOCK 64
+
+static inline float dot_bf16_scalar(const float *x, const uint16_t *w, int k) {
+    float s = 0.0f;
+    for (int t = 0; t < k; t++) s += x[t] * bf16_to_f32(w[t]);
+    return s;
+}
+
+static inline float dot_f32_scalar(const float *a, const float *b, int k) {
+    float s = 0.0f;
+    for (int t = 0; t < k; t++) s += a[t] * b[t];
+    return s;
+}
+
+void tf_riscv_matmul_bf16_shard_scalar(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1) {
+    if (m == 1) {
+        for (int j = j0; j < j1; j++) out[j] = dot_bf16_scalar(x, w + (size_t)j * k, k);
+        return;
+    }
+    for (int i0 = 0; i0 < m; i0 += TF_RISCV_ROW_BLOCK) {
+        int im = m - i0 < TF_RISCV_ROW_BLOCK ? m - i0 : TF_RISCV_ROW_BLOCK;
+        for (int j = j0; j < j1; j++) {
+            const uint16_t *wrow = w + (size_t)j * k;
+            for (int i = 0; i < im; i++) {
+                out[(size_t)(i0 + i) * n + j] = dot_bf16_scalar(x + (size_t)(i0 + i) * k, wrow, k);
+            }
+        }
+    }
+}
+
+void tf_riscv_matmul_f32_shard_scalar(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1) {
+    if (trans_b) {
+        if (m == 1) {
+            for (int j = j0; j < j1; j++) out[j] = dot_f32_scalar(a, b + (size_t)j * k, k);
+            return;
+        }
+        for (int i0 = 0; i0 < m; i0 += TF_RISCV_ROW_BLOCK) {
+            int im = m - i0 < TF_RISCV_ROW_BLOCK ? m - i0 : TF_RISCV_ROW_BLOCK;
+            for (int j = j0; j < j1; j++) {
+                const float *brow = b + (size_t)j * k;
+                for (int i = 0; i < im; i++) {
+                    out[(size_t)(i0 + i) * n + j] = dot_f32_scalar(a + (size_t)(i0 + i) * k, brow, k);
+                }
+            }
+        }
+    } else {
+        // [k,n] rows stream into the shard's columns only.
+        for (int i = 0; i < m; i++) {
+            float *orow = out + (size_t)i * n;
+            for (int j = j0; j < j1; j++) orow[j] = 0.0f;
+            for (int t = 0; t < k; t++) {
+                float av = a[(size_t)i * k + t];
+                const float *brow = b + (size_t)t * n;
+                for (int j = j0; j < j1; j++) orow[j] += av * brow[j];
+            }
+        }
+    }
+}
+
+void tf_riscv_attention_f32_scalar(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch) {
+    // One dot per key row into the caller's score buffer, then exp and mix.
     float max = -INFINITY;
     for (int t = 0; t < rows; t++) {
         const float *krow = k + (size_t)t * head_dim;
         double s = 0.0;
         for (int i = 0; i < head_dim; i++) s += (double)q[i] * (double)krow[i];
         float score = (float)((double)scale * s);
+        scratch[t] = score;
         if (score > max) max = score;
     }
     double sum = 0.0;
     for (int t = 0; t < rows; t++) {
-        const float *krow = k + (size_t)t * head_dim;
-        double s = 0.0;
-        for (int i = 0; i < head_dim; i++) s += (double)q[i] * (double)krow[i];
-        sum += exp((double)scale * s - (double)max);
+        scratch[t] = expf(scratch[t] - max);
+        sum += scratch[t];
     }
-    double inv = 1.0 / sum;
+    float inv = (float)(1.0 / sum);
     for (int i = 0; i < head_dim; i++) out[i] = 0.0f;
     for (int t = 0; t < rows; t++) {
-        const float *krow = k + (size_t)t * head_dim;
-        double s = 0.0;
-        for (int i = 0; i < head_dim; i++) s += (double)q[i] * (double)krow[i];
-        double p = exp((double)scale * s - (double)max) * inv;
+        float p = scratch[t] * inv;
         const float *vrow = v + (size_t)t * head_dim;
-        for (int i = 0; i < head_dim; i++) out[i] += (float)(p * (double)vrow[i]);
+        for (int i = 0; i < head_dim; i++) out[i] += p * vrow[i];
     }
 }
 
-// GGUF q8_0: 32 int8 + f16 scale, 34-byte blocks.
+// GGUF q8_0: 32 xi8 + f16 scale per block.
+static inline float dot_q8_0_scalar(const float *x, const uint8_t *row, int k) {
+    const int qk = 32;
+    double s = 0.0;
+    for (int b = 0; b < k / qk; b++) {
+        uint16_t sh;
+        memcpy(&sh, row + b * 34, 2);
+        float d = half_to_f32(sh);
+        const int8_t *q = (const int8_t *)(row + b * 34 + 2);
+        for (int i = 0; i < qk; i++) s += (double)x[b * qk + i] * ((double)d * (double)q[i]);
+    }
+    return (float)s;
+}
+
 void tf_riscv_gemv_q8_0_scalar(const float *x, const void *w, float *out, int n, int k) {
-    const int qk = 32;
     const uint8_t *wb = (const uint8_t *)w;
-    for (int j = 0; j < n; j++) {
-        const uint8_t *row = wb + (size_t)j * (k / qk) * 34;
-        double s = 0.0;
-        for (int b = 0; b < k / qk; b++) {
-            uint16_t sh;
-            memcpy(&sh, row + b * 34, 2);
-            float d = half_to_f32(sh);
-            const int8_t *q = (const int8_t *)(row + b * 34 + 2);
-            for (int i = 0; i < qk; i++) s += (double)x[b * qk + i] * ((double)d * (double)q[i]);
-        }
-        out[j] = (float)s;
-    }
+    for (int j = 0; j < n; j++) out[j] = dot_q8_0_scalar(x, wb + (size_t)j * (k / 32) * 34, k);
 }
 
-// GGUF q4_0: 16 bytes of u4 (32 values, lo nibble first) + f16 scale, 18-byte blocks.
-// Dequantized value = scale * (q - 8), the llama.cpp convention.
-void tf_riscv_gemv_q4_0_scalar(const float *x, const void *w, float *out, int n, int k) {
+// GGUF q4_0: 16 packed bytes (32 u4, lo nibble first) + f16 scale (18 bytes);
+// value = scale * (q - 8).
+static inline float dot_q4_0_scalar(const float *x, const uint8_t *row, int k) {
     const int qk = 32;
+    double s = 0.0;
+    for (int b = 0; b < k / qk; b++) {
+        uint16_t sh;
+        memcpy(&sh, row + b * 18, 2);
+        float d = half_to_f32(sh);
+        const uint8_t *q = row + b * 18 + 2;
+        for (int i = 0; i < qk / 2; i++) {
+            uint8_t packed = q[i];
+            s += (double)x[b * qk + 2 * i] * ((double)d * ((double)(packed & 0x0fu) - 8.0));
+            s += (double)x[b * qk + 2 * i + 1] * ((double)d * ((double)(packed >> 4) - 8.0));
+        }
+    }
+    return (float)s;
+}
+
+void tf_riscv_gemv_q4_0_scalar(const float *x, const void *w, float *out, int n, int k) {
     const uint8_t *wb = (const uint8_t *)w;
-    for (int j = 0; j < n; j++) {
-        const uint8_t *row = wb + (size_t)j * (k / qk) * 18;
-        double s = 0.0;
-        for (int b = 0; b < k / qk; b++) {
-            uint16_t sh;
-            memcpy(&sh, row + b * 18, 2);
-            float d = half_to_f32(sh);
-            const uint8_t *q = row + b * 18 + 2;
-            for (int i = 0; i < qk / 2; i++) {
-                uint8_t packed = q[i];
-                s += (double)x[b * qk + 2 * i] * ((double)d * ((double)(packed & 0x0fu) - 8.0));
-                s += (double)x[b * qk + 2 * i + 1] * ((double)d * ((double)(packed >> 4) - 8.0));
+    for (int j = 0; j < n; j++) out[j] = dot_q4_0_scalar(x, wb + (size_t)j * (k / 32) * 18, k);
+}
+
+// Quantized shards: weight rows reused across 64-row output blocks.
+void tf_riscv_matmul_q8_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    const uint8_t *wb = (const uint8_t *)w;
+    const size_t row_bytes = (size_t)(k / 32) * 34;
+    for (int i0 = 0; i0 < m; i0 += TF_RISCV_ROW_BLOCK) {
+        int im = m - i0 < TF_RISCV_ROW_BLOCK ? m - i0 : TF_RISCV_ROW_BLOCK;
+        for (int j = j0; j < j1; j++) {
+            const uint8_t *wrow = wb + (size_t)j * row_bytes;
+            for (int i = 0; i < im; i++) {
+                out[(size_t)(i0 + i) * n + j] = dot_q8_0_scalar(x + (size_t)(i0 + i) * k, wrow, k);
             }
         }
-        out[j] = (float)s;
+    }
+}
+
+void tf_riscv_matmul_q4_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    const uint8_t *wb = (const uint8_t *)w;
+    const size_t row_bytes = (size_t)(k / 32) * 18;
+    for (int i0 = 0; i0 < m; i0 += TF_RISCV_ROW_BLOCK) {
+        int im = m - i0 < TF_RISCV_ROW_BLOCK ? m - i0 : TF_RISCV_ROW_BLOCK;
+        for (int j = j0; j < j1; j++) {
+            const uint8_t *wrow = wb + (size_t)j * row_bytes;
+            for (int i = 0; i < im; i++) {
+                out[(size_t)(i0 + i) * n + j] = dot_q4_0_scalar(x + (size_t)(i0 + i) * k, wrow, k);
+            }
+        }
     }
 }

@@ -55,6 +55,7 @@ fn kernelModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     });
     mod.addIncludePath(b.path("zig/kernels/riscv"));
     mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
+    mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/pool.c"), .flags = &cflags });
     if (wantsV(target)) {
         // IME2 with its inlined reference MMA: the tests exercise the tiling
         // and dispatch under qemu at VLEN=256 and VLEN=1024. dispatch.c must
@@ -139,6 +140,7 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         });
         mod.addIncludePath(b.path("zig/kernels/riscv"));
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/pool.c"), .flags = &cflags });
         const ime2_inline = b.option(bool, "riscv-ime2-inline", "Compile the IME2 reference MMA into the CLI (correctness bring-up; the vendor runtime is the production path)") orelse false;
         if (wantsV(cli_target)) {
             var ime2_flags: std.ArrayListUnmanaged([]const u8) = .empty;

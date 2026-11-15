@@ -243,6 +243,39 @@ test "riscv kernels: matmul_f32 and matmul_bf16 against the float64 reference" {
     }
 }
 
+test "riscv kernels: shard projections match the full product" {
+    const a = t.allocator;
+    for ([_]usize{ 1, 8, 65 }) |m| {
+        for ([_]usize{ 1, 7, 33 }) |n| {
+            const k = 64;
+            const x = try a.alloc(f32, m * k);
+            defer a.free(x);
+            fill(x, m * 700 + n);
+            const w = try a.alloc(u16, n * k);
+            defer a.free(w);
+            var prng: std.Random.DefaultPrng = .init(m * 700 + n + 1);
+            const rnd = prng.random();
+            for (w) |*v| v.* = rnd.int(u16) & 0xBFFF;
+            const full = try a.alloc(f32, m * n);
+            defer a.free(full);
+            const sharded = try a.alloc(f32, m * n);
+            defer a.free(sharded);
+            for (families) |fam| {
+                if (!kernels.select(fam)) continue;
+                c.tf_riscv_matmul_bf16(x.ptr, w.ptr, full.ptr, @intCast(m), @intCast(n), @intCast(k));
+                @memset(sharded, 0);
+                // Two shards must cover the product exactly (and agree with it).
+                const half: c_int = @intCast(n / 2);
+                c.tf_riscv_matmul_bf16_shard(x.ptr, w.ptr, sharded.ptr, @intCast(m), @intCast(n), @intCast(k), 0, half);
+                c.tf_riscv_matmul_bf16_shard(x.ptr, w.ptr, sharded.ptr, @intCast(m), @intCast(n), @intCast(k), half, @intCast(n));
+                const full_f = try toF64(a, full);
+                defer a.free(full_f);
+                try expectClose(sharded, full_f, 0, 0);
+            }
+        }
+    }
+}
+
 test "riscv kernels: attention against the float64 reference" {
     const a = t.allocator;
     for ([_]usize{ 1, 3, 16, 33 }) |rows| {
@@ -267,9 +300,11 @@ test "riscv kernels: attention against the float64 reference" {
             const want = try a.alloc(f64, hd);
             defer a.free(want);
             ref.attentionF32(qf, kf, vf, want, rows, hd, 0.125);
+            const scratch = try a.alloc(f32, rows);
+            defer a.free(scratch);
             for (families) |fam| {
                 if (!kernels.select(fam)) continue;
-                c.tf_riscv_attention_f32(q.ptr, k.ptr, v.ptr, got.ptr, @intCast(rows), @intCast(hd), 0.125);
+                c.tf_riscv_attention_f32(q.ptr, k.ptr, v.ptr, got.ptr, @intCast(rows), @intCast(hd), 0.125, scratch.ptr);
                 try expectClose(got, want, 1e-5, 1e-6);
             }
         }

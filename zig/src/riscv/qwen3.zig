@@ -14,6 +14,7 @@ const std = @import("std");
 const st = @import("safetensors.zig");
 const kernels = @import("kernels.zig");
 const blas = @import("blas.zig");
+const pool = @import("pool.zig");
 
 const c = kernels.c;
 
@@ -30,8 +31,18 @@ pub const Spec = struct {
     theta: f32,
 };
 
-/// Weight storage: f32 lanes or bf16 lanes (u16), row-major [rows, cols].
-pub const Kind = enum { f32, bf16 };
+/// Weight storage: f32/bf16 lanes (row-major [rows, cols]) or GGUF q8_0/
+/// q4_0 blocks (k/32 blocks per row, k % 32 == 0).
+pub const Kind = enum { f32, bf16, q8_0, q4_0 };
+
+/// Load-time quantization for the projections (norms stay f32). q8_0: d =
+/// amax/127 rounded to f16, q = round(w/d) in [-127,127]; q4_0: d = amax/8
+/// to f16, q = round(w/d)+8 in [0,15]. tools/riscv/qwen3_parity.py applies
+/// the same convention and compares logits.
+pub const Quant = enum { none, q8_0, q4_0 };
+
+/// The quantization `Model.load` applies to 2-D projection weights.
+pub var quant: Quant = .none;
 
 pub const Weight = struct {
     rows: usize,
@@ -46,6 +57,15 @@ pub const Weight = struct {
 
     pub fn bf16Lanes(w: Weight) []const u16 {
         return @as([*]const u16, @ptrCast(@alignCast(w.mem.ptr)))[0 .. w.rows * w.cols];
+    }
+
+    /// Block bytes per weight row for the quantized kinds.
+    pub fn rowBytes(w: Weight) usize {
+        return switch (w.kind) {
+            .q8_0 => (w.cols / 32) * 34,
+            .q4_0 => (w.cols / 32) * 18,
+            else => w.cols * 4,
+        };
     }
 };
 
@@ -79,22 +99,50 @@ pub const Model = struct {
     }
 
     /// out[m,n] = x[m,k] @ w[n,k]^T: OpenBLAS when it is loaded and the
-    /// product is f32 with several rows, else the backend's kernels.
+    /// product is f32 with several rows, else the backend's kernels - sharded
+    /// over the output columns when the thread pool is up (each worker streams
+    /// its own weight rows; results are bit-identical to the serial kernel).
     pub fn project(m: *const Model, w: Weight, x: []const f32, out: []f32, rows: usize) void {
         _ = m;
         switch (w.kind) {
-            .bf16 => c.tf_riscv_matmul_bf16(x.ptr, w.bf16Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols)),
+            .bf16 => {
+                if (pool.active() > 1) {
+                    var ctx: ProjectCtx = .{ .x = x.ptr, .bf16_lanes = w.bf16Lanes().ptr, .f32_lanes = null, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols, .bf16 = true };
+                    pool.run(projectShard, &ctx, w.rows);
+                    return;
+                }
+                c.tf_riscv_matmul_bf16(x.ptr, w.bf16Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols));
+            },
+            .q8_0, .q4_0 => {
+                const raw: [*]const u8 = @ptrCast(@alignCast(w.mem.ptr));
+                if (pool.active() > 1) {
+                    var ctx: ProjectCtx = .{ .x = x.ptr, .bf16_lanes = null, .f32_lanes = null, .raw = raw, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols, .bf16 = false, .q8 = w.kind == .q8_0, .quant = true };
+                    pool.run(projectShard, &ctx, w.rows);
+                    return;
+                }
+                if (w.kind == .q8_0)
+                    c.tf_riscv_matmul_q8_0_shard(x.ptr, raw, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 0, @intCast(w.rows))
+                else
+                    c.tf_riscv_matmul_q4_0_shard(x.ptr, raw, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 0, @intCast(w.rows));
+            },
             .f32 => {
                 if (rows >= 4 and blas.gemmRowMajorTN(rows, w.rows, w.cols, x.ptr, w.f32Lanes().ptr, out.ptr)) return;
+                if (pool.active() > 1) {
+                    var ctx: ProjectCtx = .{ .x = x.ptr, .bf16_lanes = null, .f32_lanes = w.f32Lanes().ptr, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols, .bf16 = false };
+                    pool.run(projectShard, &ctx, w.rows);
+                    return;
+                }
                 c.tf_riscv_matmul_f32(x.ptr, w.f32Lanes().ptr, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 1);
             },
         }
     }
 
-    /// One row of a [rows, cols] weight table into f32 (embedding lookup).
+    /// One row of a [rows, cols] weight table into f32 (embedding lookup;
+    /// the embedding table is never quantized).
     pub fn tableRow(m: *const Model, w: Weight, row: usize, out: []f32) void {
         _ = m;
         switch (w.kind) {
+            .q8_0, .q4_0 => unreachable, // quantize() never touches the table
             .f32 => @memcpy(out, w.f32Lanes()[row * w.cols ..][0..w.cols]),
             .bf16 => {
                 const lanes = w.bf16Lanes()[row * w.cols ..][0..w.cols];
@@ -122,11 +170,22 @@ pub const Model = struct {
         const index_path = try std.fmt.allocPrint(a, "{s}/model.safetensors.index.json", .{dir});
         const index_json = std.Io.Dir.cwd().readFileAlloc(io, index_path, a, .limited(1 << 26)) catch null;
         if (index_json) |json| {
-            const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
-            defer parsed.deinit();
-            const map = parsed.value.object.get("weight_map") orelse return error.BadIndex;
-            var it = map.object.iterator();
-            while (it.next()) |e| try wanted.put(gpa, try a.dupe(u8, e.key_ptr.*), try a.dupe(u8, e.value_ptr.string));
+            // Single-file checkpoints have no index; a download failure can
+            // leave a non-JSON page behind. Neither refuses the checkpoint:
+            // without a usable weight_map the loader reads model.safetensors.
+            if (std.json.parseFromSlice(std.json.Value, gpa, json, .{})) |parsed| {
+                defer parsed.deinit();
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("weight_map")) |map| {
+                        if (map == .object) {
+                            var it = map.object.iterator();
+                            while (it.next()) |e| try wanted.put(gpa, try a.dupe(u8, e.key_ptr.*), try a.dupe(u8, e.value_ptr.string));
+                        }
+                    }
+                }
+            } else |_| {
+                std.debug.print("tensorfold-riscv: {s} is not a weight index; using model.safetensors\n", .{index_path});
+            }
         }
         const single = "model.safetensors";
 
@@ -159,7 +218,14 @@ pub const Model = struct {
             std.debug.print("tensorfold-riscv: the checkpoint has no lm_head.weight and does not tie embeddings\n", .{});
             return error.MissingTensor;
         }
-        if (m.head.mem.len == 0) m.head = m.embed;
+        if (m.head.mem.len == 0) {
+            // Tied embeddings: the head is the embedding, quantized for the
+            // logits projection when quantization is on (its own copy).
+            m.head = switch (quant) {
+                .none => m.embed,
+                .q8_0, .q4_0 => try quantize(a, m.embed, quant),
+            };
+        }
         m.arena = arena; // refresh the copy: `a` kept allocating into the local
         try m.checkComplete();
         return m;
@@ -227,13 +293,15 @@ pub const Model = struct {
                 try m.takeLayer(a, l, li, tail, name, w);
                 continue;
             }
-            const w = try normalize(a, t);
+            // The embedding stays in its checkpoint lanes (a lookup table);
+            // lm_head is a projection and quantizes like the layer weights.
+            const raw = try normalizeRaw(a, t);
             if (std.mem.eql(u8, name, "model.embed_tokens.weight")) {
-                try expectShape(name, w, s.vocab, s.hidden);
-                m.embed = w;
+                try expectShape(name, raw, s.vocab, s.hidden);
+                m.embed = raw;
             } else if (std.mem.eql(u8, name, "lm_head.weight")) {
-                try expectShape(name, w, s.vocab, s.hidden);
-                m.head = w;
+                try expectShape(name, raw, s.vocab, s.hidden);
+                m.head = try normalize(a, t);
             } else return error.UnexpectedTensor;
         }
     }
@@ -284,8 +352,76 @@ fn expectShape(name: []const u8, w: Weight, rows: usize, cols: usize) !void {
     }
 }
 
-/// Copy a tensor into owned lanes: f32 or bf16 (u16), f16 promoted to f32.
+/// Copy a tensor into owned lanes: f32 or bf16 (u16), f16 promoted to f32;
+/// projections quantize further when `quant` is set (norms never do).
 fn normalize(a: std.mem.Allocator, t: st.Tensor) !Weight {
+    const w = try normalizeRaw(a, t);
+    return switch (quant) {
+        .none => w,
+        .q8_0 => quantize(a, w, .q8_0),
+        .q4_0 => quantize(a, w, .q4_0),
+    };
+}
+
+/// f32/bf16 lanes to GGUF blocks (k % 32 == 0; q4_0 needs k % 32 == 0 too).
+fn quantize(a: std.mem.Allocator, w: Weight, mode: Quant) !Weight {
+    const rows = w.rows;
+    const k = w.cols;
+    if (k % 32 != 0) return error.QuantShape;
+    const blocks = rows * (k / 32);
+    const bytes = switch (mode) {
+        .none => unreachable,
+        .q8_0 => blocks * 34,
+        .q4_0 => blocks * 18,
+    };
+    const mem = try a.alignedAlloc(u8, .@"8", bytes);
+    const src_f32 = w.kind == .f32;
+    for (0..rows) |r| {
+        for (0..k / 32) |b| {
+            var amax: f32 = 0;
+            for (0..32) |i| {
+                const v = lane(w, r * k + b * 32 + i, src_f32);
+                amax = @max(amax, @abs(v));
+            }
+            if (mode == .q8_0) {
+                const d = amax / 127.0;
+                const d16: u16 = @bitCast(@as(f16, @floatCast(d)));
+                const dst = mem.ptr + (r * (k / 32) + b) * 34;
+                @as(*u16, @ptrCast(@alignCast(dst))).* = d16;
+                for (0..32) |i| {
+                    const v = lane(w, r * k + b * 32 + i, src_f32);
+                    var q: i32 = 0;
+                    if (d > 0) q = @intFromFloat(@round(v / d));
+                    q = @max(-127, @min(127, q));
+                    dst[2 + i] = @bitCast(@as(i8, @intCast(q)));
+                }
+            } else {
+                const d = amax / 8.0;
+                const d16: u16 = @bitCast(@as(f16, @floatCast(d)));
+                const dst = mem.ptr + (r * (k / 32) + b) * 18;
+                @as(*u16, @ptrCast(@alignCast(dst))).* = d16;
+                for (0..16) |i| {
+                    var lo: i32 = 8;
+                    var hi: i32 = 8;
+                    if (d > 0) {
+                        lo = @as(i32, @intFromFloat(@round(lane(w, r * k + b * 32 + 2 * i, src_f32) / d))) + 8;
+                        hi = @as(i32, @intFromFloat(@round(lane(w, r * k + b * 32 + 2 * i + 1, src_f32) / d))) + 8;
+                    }
+                    lo = @max(0, @min(15, lo));
+                    hi = @max(0, @min(15, hi));
+                    dst[2 + i] = @intCast(lo | (hi << 4));
+                }
+            }
+        }
+    }
+    return .{ .rows = rows, .cols = k, .kind = if (mode == .q8_0) .q8_0 else .q4_0, .mem = mem };
+}
+
+fn lane(w: Weight, idx: usize, src_f32: bool) f32 {
+    return if (src_f32) w.f32Lanes()[idx] else @as(f32, @bitCast(@as(u32, w.bf16Lanes()[idx]) << 16));
+}
+
+fn normalizeRaw(a: std.mem.Allocator, t: st.Tensor) !Weight {
     if (t.shape.len != 2) return error.BadShape;
     const rows = t.shape[0];
     const cols = t.shape[1];
@@ -364,6 +500,69 @@ fn readSpec(gpa: std.mem.Allocator, json: []const u8) !Spec {
     };
 }
 
+/// One layer's attention for the pool's head shards.
+const AttnCtx = struct {
+    session: *Session,
+    layer: usize,
+    q: []const f32,
+    attn: []f32,
+    T: usize,
+    scale: f32,
+};
+
+fn attnShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
+    const a: *AttnCtx = @ptrCast(@alignCast(ctx.?));
+    attnShardRun(a, begin, end);
+}
+
+fn attnShardRun(a: *AttnCtx, begin: c_int, end: c_int) void {
+    const s = a.session;
+    const spec = s.model.spec;
+    const qw = spec.heads * spec.head_dim;
+    const hd = spec.head_dim;
+    for (@as(usize, @intCast(begin))..@as(usize, @intCast(end))) |h| {
+        const kvh = h / (spec.heads / spec.kv_heads);
+        const scratch = s.scratch_rows[h * s.ctx ..][0..s.ctx];
+        for (0..a.T) |t| {
+            const rows = s.pos + t + 1;
+            const krows = s.panel(s.k_cache, a.layer, kvh)[0 .. rows * hd];
+            const vrows = s.panel(s.v_cache, a.layer, kvh)[0 .. rows * hd];
+            c.tf_riscv_attention_f32(a.q[t * qw + h * hd ..].ptr, krows.ptr, vrows.ptr, a.attn[t * qw + h * hd ..].ptr, @intCast(rows), @intCast(hd), a.scale, scratch.ptr);
+        }
+    }
+}
+
+/// One projection for the pool's shard trampoline.
+const ProjectCtx = struct {
+    x: [*]const f32,
+    bf16_lanes: ?[*]const u16,
+    f32_lanes: ?[*]const f32,
+    raw: ?[*]const u8 = null,
+    out: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    bf16: bool,
+    q8: bool = false,
+    quant: bool = false,
+};
+
+/// A pool shard: output columns [begin, end) of one projection.
+fn projectShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
+    const p: *ProjectCtx = @ptrCast(@alignCast(ctx.?));
+    if (p.quant) {
+        if (p.q8) {
+            c.tf_riscv_matmul_q8_0_shard(p.x, p.raw.?, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), begin, end);
+        } else {
+            c.tf_riscv_matmul_q4_0_shard(p.x, p.raw.?, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), begin, end);
+        }
+    } else if (p.bf16) {
+        c.tf_riscv_matmul_bf16_shard(p.x, p.bf16_lanes.?, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), begin, end);
+    } else {
+        c.tf_riscv_matmul_f32_shard(p.x, p.f32_lanes.?, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), 1, begin, end);
+    }
+}
+
 /// One generation session: per-layer, per-KV-head caches the kernel
 /// attention reads as contiguous [rows, head_dim] panels.
 pub const Session = struct {
@@ -373,6 +572,8 @@ pub const Session = struct {
     pos: usize = 0,
     k_cache: []f32,
     v_cache: []f32,
+    /// Per-head score rows for attention (heads * ctx floats).
+    scratch_rows: []f32,
     scratch: std.heap.ArenaAllocator,
 
     pub fn init(gpa: std.mem.Allocator, model: *const Model, ctx: usize) !Session {
@@ -384,6 +585,7 @@ pub const Session = struct {
             .ctx = ctx,
             .k_cache = try gpa.alloc(f32, total),
             .v_cache = try gpa.alloc(f32, total),
+            .scratch_rows = try gpa.alloc(f32, s.heads * ctx),
             .scratch = .init(gpa),
         };
     }
@@ -392,6 +594,7 @@ pub const Session = struct {
         s.scratch.deinit();
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
+        gpa.free(s.scratch_rows);
         s.* = undefined;
     }
 
@@ -448,15 +651,21 @@ pub const Session = struct {
                     @memcpy(dst_v, v[t * kvw + h * spec.head_dim ..][0..spec.head_dim]);
                 }
             }
-            for (0..T) |t| {
-                const pos: usize = s.pos + t;
-                for (0..spec.heads) |h| {
-                    const kvh = h / (spec.heads / spec.kv_heads);
-                    const rows: usize = pos + 1;
-                    const krows = s.panel(s.k_cache, li, kvh)[0 .. rows * spec.head_dim];
-                    const vrows = s.panel(s.v_cache, li, kvh)[0 .. rows * spec.head_dim];
-                    c.tf_riscv_attention_f32(q[t * qw + h * spec.head_dim ..].ptr, krows.ptr, vrows.ptr, attn[t * qw + h * spec.head_dim ..].ptr, @intCast(rows), @intCast(spec.head_dim), scale);
-                }
+            // Attention over the cache: sharded across heads when the pool is
+            // up (each head is independent), one score row per head in the
+            // session's scratch.
+            var actx: AttnCtx = .{
+                .session = s,
+                .layer = li,
+                .q = q,
+                .attn = attn,
+                .T = T,
+                .scale = scale,
+            };
+            if (pool.active() > 1) {
+                pool.run(attnShard, &actx, spec.heads);
+            } else {
+                attnShardRun(&actx, 0, @intCast(spec.heads));
             }
             m.project(l.o, attn, o, T);
             for (0..T) |t| c.tf_riscv_add(x[t * spec.hidden ..].ptr, o[t * spec.hidden ..].ptr, x[t * spec.hidden ..].ptr, @intCast(spec.hidden));

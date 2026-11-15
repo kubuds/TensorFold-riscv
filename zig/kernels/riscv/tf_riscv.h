@@ -65,14 +65,27 @@ void tf_riscv_matmul_f32(const float *a, const float *b, float *out, int m, int 
 // The decode hot path: GEMV when m == 1.
 void tf_riscv_matmul_bf16(const float *x, const uint16_t *w, float *out, int m, int n, int k);
 
+// One output-column shard [j0,j1) of the two products above: the multithreaded
+// path splits rows of w across threads, each streaming its own sequential
+// weight range (the K3 paper's thread-sharded sequential read pattern).
+// m > 1 re-reads each weight row only every 64 output rows (prefill traffic).
+void tf_riscv_matmul_bf16_shard(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_f32_shard(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
+
 // One query row's attention over `rows` cached keys/values: softmax(scale*q.k)
-// then the value mix, per head of head_dim elements.
-void tf_riscv_attention_f32(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale);
+// then the value mix, per head of head_dim elements. `scratch` holds `rows`
+// floats (the score buffer): one dot pass per key row, not three.
+void tf_riscv_attention_f32(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 
 // Quantized GGUF block GEMV: out[n] = x[k] . w[n,k]^T, dequantizing blocks.
 // q8_0 blocks: 32 xi8 + f16 scale; q4_0 blocks: 16 bytes (32 u4) + f16 scale.
 void tf_riscv_gemv_q8_0(const float *x, const void *w, float *out, int n, int k);
 void tf_riscv_gemv_q4_0(const float *x, const void *w, float *out, int n, int k);
+
+// Quantized projections for m rows over output columns [j0,j1) (the
+// multithreaded and prefill paths); blocks follow the two GEMV formats.
+void tf_riscv_matmul_q8_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_q4_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 
 #ifdef __cplusplus
 }

@@ -27,9 +27,13 @@ typedef struct {
     void (*add)(const float *, const float *, float *, int);
     void (*matmul_f32)(const float *, const float *, float *, int, int, int, int);
     void (*matmul_bf16)(const float *, const uint16_t *, float *, int, int, int);
-    void (*attention_f32)(const float *, const float *, const float *, float *, int, int, float);
+    void (*matmul_bf16_shard)(const float *, const uint16_t *, float *, int, int, int, int, int);
+    void (*matmul_f32_shard)(const float *, const float *, float *, int, int, int, int, int, int);
+    void (*attention_f32)(const float *, const float *, const float *, float *, int, int, float, float *);
     void (*gemv_q8_0)(const float *, const void *, float *, int, int);
     void (*gemv_q4_0)(const float *, const void *, float *, int, int);
+    void (*matmul_q8_0_shard)(const float *, const void *, float *, int, int, int, int, int);
+    void (*matmul_q4_0_shard)(const float *, const void *, float *, int, int, int, int, int);
 } tf_riscv_ops;
 
 void tf_riscv_rmsnorm_scalar(const float *x, const float *w, float *out, int n, float eps);
@@ -39,8 +43,12 @@ void tf_riscv_silu_mul_scalar(const float *gate, const float *up, float *out, in
 void tf_riscv_add_scalar(const float *a, const float *b, float *out, int n);
 void tf_riscv_matmul_f32_scalar(const float *a, const float *b, float *out, int m, int n, int k, int trans_b);
 void tf_riscv_matmul_bf16_scalar(const float *x, const uint16_t *w, float *out, int m, int n, int k);
-void tf_riscv_attention_f32_scalar(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale);
+void tf_riscv_matmul_bf16_shard_scalar(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_f32_shard_scalar(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
+void tf_riscv_attention_f32_scalar(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 void tf_riscv_gemv_q8_0_scalar(const float *x, const void *w, float *out, int n, int k);
+void tf_riscv_matmul_q8_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_q4_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_gemv_q4_0_scalar(const float *x, const void *w, float *out, int n, int k);
 
 static const tf_riscv_ops scalar_ops = {
@@ -52,9 +60,13 @@ static const tf_riscv_ops scalar_ops = {
     tf_riscv_add_scalar,
     tf_riscv_matmul_f32_scalar,
     tf_riscv_matmul_bf16_scalar,
+    tf_riscv_matmul_bf16_shard_scalar,
+    tf_riscv_matmul_f32_shard_scalar,
     tf_riscv_attention_f32_scalar,
     tf_riscv_gemv_q8_0_scalar,
     tf_riscv_gemv_q4_0_scalar,
+    tf_riscv_matmul_q8_0_shard_scalar,
+    tf_riscv_matmul_q4_0_shard_scalar,
 };
 
 #if defined(__riscv) && defined(__riscv_vector)
@@ -65,8 +77,12 @@ void tf_riscv_silu_mul_rvv(const float *gate, const float *up, float *out, int n
 void tf_riscv_add_rvv(const float *a, const float *b, float *out, int n);
 void tf_riscv_matmul_f32_rvv(const float *a, const float *b, float *out, int m, int n, int k, int trans_b);
 void tf_riscv_matmul_bf16_rvv(const float *x, const uint16_t *w, float *out, int m, int n, int k);
-void tf_riscv_attention_f32_rvv(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale);
+void tf_riscv_matmul_bf16_shard_rvv(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_f32_shard_rvv(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
+void tf_riscv_attention_f32_rvv(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 void tf_riscv_gemv_q8_0_rvv(const float *x, const void *w, float *out, int n, int k);
+void tf_riscv_matmul_q8_0_shard_rvv(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_q4_0_shard_rvv(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_gemv_q4_0_rvv(const float *x, const void *w, float *out, int n, int k);
 
 static const tf_riscv_ops rvv_ops = {
@@ -78,9 +94,13 @@ static const tf_riscv_ops rvv_ops = {
     tf_riscv_add_rvv,
     tf_riscv_matmul_f32_rvv,
     tf_riscv_matmul_bf16_rvv,
+    tf_riscv_matmul_bf16_shard_rvv,
+    tf_riscv_matmul_f32_shard_rvv,
     tf_riscv_attention_f32_rvv,
     tf_riscv_gemv_q8_0_rvv,
     tf_riscv_gemv_q4_0_rvv,
+    tf_riscv_matmul_q8_0_shard_rvv,
+    tf_riscv_matmul_q4_0_shard_rvv,
 };
 #endif
 
@@ -95,8 +115,12 @@ void tf_riscv_silu_mul_ime2(const float *gate, const float *up, float *out, int 
 void tf_riscv_add_ime2(const float *a, const float *b, float *out, int n);
 void tf_riscv_matmul_f32_ime2(const float *a, const float *b, float *out, int m, int n, int k, int trans_b);
 void tf_riscv_matmul_bf16_ime2(const float *x, const uint16_t *w, float *out, int m, int n, int k);
-void tf_riscv_attention_f32_ime2(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale);
+void tf_riscv_matmul_bf16_shard_ime2(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_f32_shard_ime2(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
+void tf_riscv_attention_f32_ime2(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 void tf_riscv_gemv_q8_0_ime2(const float *x, const void *w, float *out, int n, int k);
+void tf_riscv_matmul_q8_0_shard_ime2(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_q4_0_shard_ime2(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_gemv_q4_0_ime2(const float *x, const void *w, float *out, int n, int k);
 
 static const tf_riscv_ops ime2_ops = {
@@ -108,9 +132,13 @@ static const tf_riscv_ops ime2_ops = {
     tf_riscv_add_ime2,
     tf_riscv_matmul_f32_ime2,
     tf_riscv_matmul_bf16_ime2,
+    tf_riscv_matmul_bf16_shard_ime2,
+    tf_riscv_matmul_f32_shard_ime2,
     tf_riscv_attention_f32_ime2,
     tf_riscv_gemv_q8_0_ime2,
     tf_riscv_gemv_q4_0_ime2,
+    tf_riscv_matmul_q8_0_shard_ime2,
+    tf_riscv_matmul_q4_0_shard_ime2,
 };
 #endif
 
@@ -228,8 +256,20 @@ void tf_riscv_matmul_f32(const float *a, const float *b, float *out, int m, int 
 void tf_riscv_matmul_bf16(const float *x, const uint16_t *w, float *out, int m, int n, int k) {
     ops->matmul_bf16(x, w, out, m, n, k);
 }
-void tf_riscv_attention_f32(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale) {
-    ops->attention_f32(q, k, v, out, rows, head_dim, scale);
+void tf_riscv_matmul_bf16_shard(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1) {
+    ops->matmul_bf16_shard(x, w, out, m, n, k, j0, j1);
+}
+void tf_riscv_matmul_f32_shard(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1) {
+    ops->matmul_f32_shard(a, b, out, m, n, k, trans_b, j0, j1);
+}
+void tf_riscv_attention_f32(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch) {
+    ops->attention_f32(q, k, v, out, rows, head_dim, scale, scratch);
 }
 void tf_riscv_gemv_q8_0(const float *x, const void *w, float *out, int n, int k) { ops->gemv_q8_0(x, w, out, n, k); }
 void tf_riscv_gemv_q4_0(const float *x, const void *w, float *out, int n, int k) { ops->gemv_q4_0(x, w, out, n, k); }
+void tf_riscv_matmul_q8_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    ops->matmul_q8_0_shard(x, w, out, m, n, k, j0, j1);
+}
+void tf_riscv_matmul_q4_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    ops->matmul_q4_0_shard(x, w, out, m, n, k, j0, j1);
+}

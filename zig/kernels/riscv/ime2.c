@@ -38,8 +38,12 @@ void tf_riscv_silu_mul_rvv(const float *gate, const float *up, float *out, int n
 void tf_riscv_add_rvv(const float *a, const float *b, float *out, int n);
 void tf_riscv_matmul_f32_rvv(const float *a, const float *b, float *out, int m, int n, int k, int trans_b);
 void tf_riscv_matmul_bf16_rvv(const float *x, const uint16_t *w, float *out, int m, int n, int k);
-void tf_riscv_attention_f32_rvv(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale);
+void tf_riscv_matmul_bf16_shard_rvv(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_f32_shard_rvv(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
+void tf_riscv_attention_f32_rvv(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 void tf_riscv_gemv_q8_0_rvv(const float *x, const void *w, float *out, int n, int k);
+void tf_riscv_matmul_q8_0_shard_rvv(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_matmul_q4_0_shard_rvv(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_gemv_q4_0_rvv(const float *x, const void *w, float *out, int n, int k);
 
 // --- the reference MMA (TF_RISCV_IME2_INLINE or the tools/riscv shim) ------
@@ -138,11 +142,21 @@ void tf_riscv_add_ime2(const float *a, const float *b, float *out, int n) { tf_r
 void tf_riscv_matmul_f32_ime2(const float *a, const float *b, float *out, int m, int n, int k, int trans_b) {
     tf_riscv_matmul_f32_rvv(a, b, out, m, n, k, trans_b); // f32 x f32 is not an IME2 shape
 }
-void tf_riscv_attention_f32_ime2(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale) {
-    tf_riscv_attention_f32_rvv(q, k, v, out, rows, head_dim, scale);
+void tf_riscv_attention_f32_ime2(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch) {
+    tf_riscv_attention_f32_rvv(q, k, v, out, rows, head_dim, scale, scratch);
 }
 void tf_riscv_gemv_q8_0_ime2(const float *x, const void *w, float *out, int n, int k) { tf_riscv_gemv_q8_0_rvv(x, w, out, n, k); }
 void tf_riscv_gemv_q4_0_ime2(const float *x, const void *w, float *out, int n, int k) { tf_riscv_gemv_q4_0_rvv(x, w, out, n, k); }
+void tf_riscv_matmul_q8_0_shard_ime2(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    tf_riscv_matmul_q8_0_shard_rvv(x, w, out, m, n, k, j0, j1);
+}
+void tf_riscv_matmul_q4_0_shard_ime2(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1) {
+    tf_riscv_matmul_q4_0_shard_rvv(x, w, out, m, n, k, j0, j1);
+}
+
+void tf_riscv_matmul_f32_shard_ime2(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1) {
+    tf_riscv_matmul_f32_shard_rvv(a, b, out, m, n, k, trans_b, j0, j1);
+}
 
 // f32 -> bf16 lanes (round to nearest even on the low bit).
 static inline uint16_t f32_to_bf16(float f) {
@@ -152,18 +166,21 @@ static inline uint16_t f32_to_bf16(float f) {
     return (uint16_t)((u + 0x7fffu + lsb) >> 16);
 }
 
-// y[m,n] = x[m,k] @ w[n,k]^T through 8x8 bf16 MMA tiles; m < 8 or no vendor
-// runtime: the RVV GEMV path (decode rows never benefit from the MMA).
-void tf_riscv_matmul_bf16_ime2(const float *x, const uint16_t *w, float *out, int m, int n, int k) {
+// y[m, j0:j1] = x[m,k] @ w[j0:j1,k]^T through 8x8 bf16 MMA tiles. The k
+// tiling only depends on k, so every output element accumulates identically
+// whatever column range computes it: full call and shards agree bit for bit
+// (the kernel tests rely on that). m < 8 or no vendor runtime: the RVV GEMV
+// path (decode rows never benefit from the MMA).
+static void matmul_bf16_ime2_tiled(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1) {
     load_vendor();
     if (m < 8 || !vendor || !vendor->mma_bf16 || (vendor->available && !vendor->available())) {
-        tf_riscv_matmul_bf16_rvv(x, w, out, m, n, k);
+        tf_riscv_matmul_bf16_shard_rvv(x, w, out, m, n, k, j0, j1);
         return;
     }
     for (int i0 = 0; i0 < m; i0 += 8) {
         int mi = m - i0 < 8 ? m - i0 : 8;
-        for (int j0 = 0; j0 < n; j0 += 8) {
-            int nj = n - j0 < 8 ? n - j0 : 8;
+        for (int jc = j0; jc < j1; jc += 8) {
+            int nj = j1 - jc < 8 ? j1 - jc : 8;
             float acc[64];
             memset(acc, 0, sizeof(acc));
             for (int t0 = 0; t0 < k; t0 += 8) {
@@ -175,13 +192,22 @@ void tf_riscv_matmul_bf16_ime2(const float *x, const uint16_t *w, float *out, in
                     for (int t = 0; t < kt; t++) at[i * 8 + t] = f32_to_bf16(x[(size_t)(i0 + i) * k + t0 + t]);
                 }
                 for (int j = 0; j < nj; j++) {
-                    for (int t = 0; t < kt; t++) bt[t * 8 + j] = w[(size_t)(j0 + j) * k + t0 + t];
+                    for (int t = 0; t < kt; t++) bt[t * 8 + j] = w[(size_t)(jc + j) * k + t0 + t];
                 }
                 vendor->mma_bf16(at, bt, acc, acc);
             }
             for (int i = 0; i < mi; i++) {
-                for (int j = 0; j < nj; j++) out[(size_t)(i0 + i) * n + j0 + j] = acc[i * 8 + j];
+                for (int j = 0; j < nj; j++) out[(size_t)(i0 + i) * n + jc + j] = acc[i * 8 + j];
             }
         }
     }
+}
+
+void tf_riscv_matmul_bf16_ime2(const float *x, const uint16_t *w, float *out, int m, int n, int k) {
+    matmul_bf16_ime2_tiled(x, w, out, m, n, k, 0, n);
+}
+
+// The shard form the thread pool calls: same tiles, bounded columns.
+void tf_riscv_matmul_bf16_shard_ime2(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1) {
+    matmul_bf16_ime2_tiled(x, w, out, m, n, k, j0, j1);
 }

@@ -10,7 +10,10 @@ HERE="$(dirname "$0")"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 python3 tools/riscv/qwen3_parity.py --bin "$BIN" --work .zig-cache/riscv-parity
+for q in q8_0 q4_0; do
+  python3 tools/riscv/qwen3_parity.py --bin "$BIN" --work ".zig-cache/riscv-parity-$q" --quant "$q"
+done
 STUB=.zig-cache/libtfblas_stub.so
 zig cc -shared -fPIC -O2 tools/riscv/openblas_stub.c -o "$STUB"
 TF_RISCV_BLAS="$ROOT/$STUB" python3 tools/riscv/qwen3_parity.py --bin "$BIN" --work .zig-cache/riscv-parity-blas
-echo "parity: kernel path and OpenBLAS path both OK"
+echo "parity: kernel path, quantized paths and OpenBLAS path all OK"

@@ -198,6 +198,37 @@ test "riscv qwen3: every kernel family agrees on the synthetic forward" {
     }
 }
 
+test "riscv qwen3: the thread pool matches the serial forward bit for bit" {
+    const gpa = t.allocator;
+    const dir = ".zig-cache/riscv-tiny-c";
+    try writeCheckpoint(gpa, dir);
+    var model = try qwen3.Model.load(gpa, t.io, dir);
+    defer model.deinit();
+
+    const ids = [_]u32{ 3, 14, 1, 5, 9, 77, 4, 2 };
+    const vocab = model.spec.vocab;
+    const serial = try gpa.alloc(f32, vocab * ids.len);
+    defer gpa.free(serial);
+    const threaded = try gpa.alloc(f32, vocab * ids.len);
+    defer gpa.free(threaded);
+    {
+        var s = try qwen3.Session.init(gpa, &model, 64);
+        defer s.deinit(gpa);
+        try s.forward(&ids, serial, true);
+    }
+    const pool = @import("pool.zig");
+    const ran = pool.init(4);
+    defer _ = pool.init(1);
+    try t.expectEqual(@as(usize, 4), ran);
+    {
+        var s = try qwen3.Session.init(gpa, &model, 64);
+        defer s.deinit(gpa);
+        try s.forward(&ids, threaded, true);
+    }
+    // Disjoint output shards: the pool must be bit-identical to the serial run.
+    try t.expectEqualSlices(f32, serial, threaded);
+}
+
 test "riscv qwen3: safetensors refuses a truncated file" {
     const path = ".zig-cache/riscv-bad.safetensors";
     {

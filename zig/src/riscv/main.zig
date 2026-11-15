@@ -11,6 +11,7 @@
 const std = @import("std");
 const kernels = @import("kernels.zig");
 const blas = @import("blas.zig");
+const pool = @import("pool.zig");
 const qwen3 = @import("qwen3.zig");
 const tokenizer = @import("tokenizer");
 const build_info = @import("riscv_build");
@@ -70,7 +71,9 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
             pick = args[i];
         } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
             i += 1;
-            blas.setThreads(@intCast(std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{})));
+            const n = std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{});
+            _ = pool.init(n);
+            blas.setThreads(@intCast(n));
         } else fail("caps: unknown argument {s}", .{args[i]});
     }
     if (pick) |p| {
@@ -82,6 +85,7 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         \\version: {s}
         \\kernels: {s}
         \\vlen_bits: {d}
+        \\threads: {d}
         \\blas: {s}
         \\cap_rvv: {}
         \\cap_ime1: {}
@@ -91,6 +95,7 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         build_info.version,
         kernels.activeKernels(),
         kernels.vlenBits(),
+        pool.active(),
         blas.name(),
         caps & kernels.Cap.rvv != 0,
         caps & kernels.Cap.ime1 != 0,
@@ -133,7 +138,10 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
         } else if (std.mem.eql(u8, key, "report")) {
             common.report = args[i];
         } else if (std.mem.eql(u8, key, "threads")) {
-            blas.setThreads(@intCast(std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{})));
+            const n = std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{});
+            if (n < 1) fail("--threads needs at least 1", .{});
+            _ = pool.init(n);
+            blas.setThreads(@intCast(n));
         } else if (std.mem.eql(u8, key, "cpus")) {
             if (kernels.c.tf_riscv_bind_cpus(args[i].ptr) != 0) fail("cannot pin to CPUs {s}", .{args[i]});
         } else {
@@ -178,6 +186,19 @@ fn writeReport(init: std.process.Init, path: ?[]const u8, body: []const u8) !voi
     try file.writeStreamingAll(init.io, body);
 }
 
+/// Load-time weight quantization: --quant none|q8_0|q4_0.
+fn setQuant(v: ?[]const u8) void {
+    const name = v orelse "none";
+    qwen3.quant = if (std.mem.eql(u8, name, "none"))
+        .none
+    else if (std.mem.eql(u8, name, "q8_0"))
+        .q8_0
+    else if (std.mem.eql(u8, name, "q4_0"))
+        .q4_0
+    else
+        fail("--quant needs none, q8_0 or q4_0", .{});
+}
+
 /// One prompt row's logits as decimal text (the parity oracle reads them).
 fn writeLogits(init: std.process.Init, gpa: std.mem.Allocator, path: []const u8, logits: []const f32) !void {
     const file = try std.Io.Dir.cwd().createFile(init.io, path, .{});
@@ -193,7 +214,8 @@ fn writeLogits(init: std.process.Init, gpa: std.mem.Allocator, path: []const u8,
 }
 
 fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]const u8) !u8 {
-    const common = parseCommon(gpa, args, &.{ "prompt", "tokens", "max-tokens", "temperature", "top-p", "seed", "logits-out" });
+    const common = parseCommon(gpa, args, &.{ "prompt", "tokens", "max-tokens", "temperature", "top-p", "seed", "logits-out", "quant" });
+    setQuant(common.values.get("quant"));
     pickKernels(common.kernels_pick);
     const max_tokens: usize = if (common.values.get("max-tokens")) |v| std.fmt.parseInt(usize, v, 10) catch fail("--max-tokens needs a number", .{}) else 128;
     const temperature: f32 = if (common.values.get("temperature")) |v| std.fmt.parseFloat(f32, v) catch fail("--temperature needs a number", .{}) else 0;
@@ -271,7 +293,9 @@ fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]
         .command = "run",
         .kernels = kernels.activeKernels(),
         .vlen_bits = kernels.vlenBits(),
+        .threads = pool.active(),
         .blas = blas.name(),
+        .quant = @tagName(qwen3.quant),
         .prompt_tokens = prompt_ids.len,
         .generated = generated.items.len,
         .prefill_seconds = prefill_s,
@@ -286,7 +310,8 @@ fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]
 }
 
 fn benchCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]const u8) !u8 {
-    const common = parseCommon(gpa, args, &.{ "prefill", "decode" });
+    const common = parseCommon(gpa, args, &.{ "prefill", "decode", "quant" });
+    setQuant(common.values.get("quant"));
     pickKernels(common.kernels_pick);
     const prefill_n: usize = if (common.values.get("prefill")) |v| std.fmt.parseInt(usize, v, 10) catch fail("--prefill needs a number", .{}) else 512;
     const decode_n: usize = if (common.values.get("decode")) |v| std.fmt.parseInt(usize, v, 10) catch fail("--decode needs a number", .{}) else 128;
@@ -333,7 +358,9 @@ fn benchCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:
         .command = "bench",
         .kernels = kernels.activeKernels(),
         .vlen_bits = kernels.vlenBits(),
+        .threads = pool.active(),
         .blas = blas.name(),
+        .quant = @tagName(qwen3.quant),
         .prefill_tokens = prefill_n,
         .prefill_seconds = prefill_s,
         .prefill_tok_s = @as(f64, @floatFromInt(prefill_n)) / @max(prefill_s, 1e-9),

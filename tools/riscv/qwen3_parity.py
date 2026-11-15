@@ -79,6 +79,39 @@ def build_checkpoint(work):
     return w
 
 
+def round_half_away(x):
+    return np.sign(x) * np.floor(np.abs(x) + 0.5)
+
+
+def dequantized(w, mode):
+    """The weights the kernels compute with after load-time quantization:
+    blocks of 32 along the last axis; d = amax/127 (q8_0) or amax/8 (q4_0)
+    rounded to f16, q = round_half_away(w/d) clamped; value = q*d16 resp.
+    (q-8)*d16. Mirrors zig/src/riscv/qwen3.zig `quantize` exactly."""
+    if mode == "none":
+        return w.astype(np.float64)
+    out = np.empty_like(w, dtype=np.float64)
+    last = w.shape[-1]
+    assert last % 32 == 0
+    flat = w.reshape(-1, last)
+    outf = out.reshape(-1, last)
+    for r in range(flat.shape[0]):
+        for b in range(last // 32):
+            blk = flat[r, b * 32 : (b + 1) * 32].astype(np.float64)
+            amax = np.abs(blk).max()
+            if mode == "q8_0":
+                d = amax / 127.0
+                d16 = float(np.float16(d))
+                q = np.clip(round_half_away(blk / d) if d > 0 else 0, -127, 127)
+                outf[r, b * 32 : (b + 1) * 32] = q * d16
+            else:
+                d = amax / 8.0
+                d16 = float(np.float16(d))
+                q = np.clip(round_half_away(blk / d) + 8 if d > 0 else 8, 0, 15)
+                outf[r, b * 32 : (b + 1) * 32] = (q - 8) * d16
+    return out
+
+
 def rmsnorm(x, wgt):
     return x / np.sqrt(np.mean(x * x) + EPS) * wgt
 
@@ -137,7 +170,8 @@ def forward(w, ids):
         act = (gate / (1.0 + np.exp(-gate))) * up
         x = x + act @ w[p + "mlp.down_proj.weight"].T.astype(np.float64)
     out = np.array([rmsnorm(x[t], w["model.norm.weight"]) for t in range(T)])
-    return out @ w["model.embed_tokens.weight"].T.astype(np.float64)
+    head = w.get("__head__", w["model.embed_tokens.weight"])
+    return out @ head.T.astype(np.float64)
 
 
 def main():
@@ -146,15 +180,30 @@ def main():
     ap.add_argument("--work", default=".zig-cache/riscv-parity")
     ap.add_argument("--tokens", default="3,14,1,5,9,2,6")
     ap.add_argument("--generate", type=int, default=8)
+    ap.add_argument("--quant", default="none", choices=["none", "q8_0", "q4_0"])
     args = ap.parse_args()
 
     ids = [int(x) for x in args.tokens.split(",")]
     w = build_checkpoint(args.work)
+    if args.quant != "none":
+        wq = {}
+        for name, arr in w.items():
+            # Norms (1-D) and the embedding table never quantize; lm_head -
+            # tied to the embedding in this checkpoint - gets its own
+            # quantized copy like the Zig loader builds.
+            if arr.ndim == 1 or name == "model.embed_tokens.weight":
+                wq[name] = arr
+            else:
+                wq[name] = dequantized(arr, args.quant).astype(np.float32)
+        wq["__head__"] = dequantized(w["model.embed_tokens.weight"], args.quant).astype(np.float32)
+        w = wq
     ref = forward(w, ids)
 
     logits_path = os.path.join(args.work, "zig_logits.txt")
     cmd = [args.bin, "run", args.work, "--tokens", args.tokens, "--max-tokens", str(args.generate),
            "--context", "64", "--logits-out", logits_path]
+    if args.quant != "none":
+        cmd += ["--quant", args.quant]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         print(proc.stdout)
@@ -165,7 +214,7 @@ def main():
 
     scale = np.abs(ref_row).max()
     err = np.abs(zig_logits - ref_row).max()
-    print(f"logits: max|zig - numpy| = {err:.3e} on scale {scale:.3e} (tol {1e-3 * scale + 1e-4:.3e})")
+    print(f"logits: max|zig - numpy| = {err:.3e} on scale {scale:.3e} (tol {1e-3 * scale + 1e-4:.3e}) [quant={args.quant}]")
 
     # Greedy sequences must match token for token.
     seq = list(ids)
