@@ -1,3 +1,11 @@
+> **K3 A100 + IME2 + TCM/HPAGE port (this round).** The backend now also runs
+> the weights as q4x (4-bit, packed in SpacemiT IME2 dot tiles) and hands the
+> sharded kernels to the A100 tiles through the spine runtime, with TCM
+> scratch and `MADV_HUGEPAGE` weights. See
+> [the port and its reproduction guide](riscv-k3-ime2-port.md) and
+> [performance against the vendor baseline](riscv-k3-performance.md). The
+> measurements below are the X100/RVV round that preceded it.
+
 # RISC-V backend performance report (SpacemiT K3)
 
 All numbers were measured on the K3 test machine `k3pico16g.local` (Bianbu

@@ -87,6 +87,67 @@ void tf_riscv_gemv_q4_0(const float *x, const void *w, float *out, int n, int k)
 void tf_riscv_matmul_q8_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_matmul_q4_0_shard(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 
+// ---- q4x: 4-bit weights in IME2 dot tiles --------------------------------
+//
+// Weights are packed in 8-output-row blocks for SpacemiT's IME2 dot (vmadot,
+// 8x8x16 int8 -> int32). Per 32-k chunk a tile is 128 bytes: byte t holds
+// w[r0 + t/16][k0 + t%16] in its low nibble and w[r0 + t/16][k0 + 16 + t%16]
+// in its high nibble, so one load gives both vmadot operands. Per block the
+// scales come first: (k/256) groups x 8 rows x f16, value w = q_signed * d.
+// Block stride is 4k + k/16 bytes (4.0625 bits per weight at k=1024).
+//
+// Activations are quantized to int8 with one f32 scale per 256-value group and
+// tiled as vmadot's A operand: per 8-row block and 16-k chunk, 128 bytes.
+size_t tf_riscv_q4x_block_bytes(int k);
+size_t tf_riscv_q4x_row_bytes(int k);
+int tf_riscv_q4x_ok(int k);
+int tf_riscv_q4x_perm_k(int u);
+
+// int8 activation tiles + per-row group scales (tutorial: qwen3.zig quantizeQ4x).
+void tf_riscv_quant_a(const float *x, int8_t *xa, float *xs, int m, int k);
+void tf_riscv_quant_a_scalar(const float *x, int8_t *xa, float *xs, int m, int k);
+
+// Decode (m == 1) and prefill (m rows): out[m][n] = x[m][k] @ w[n][k]^T.
+void tf_riscv_gemv_q4x(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k);
+void tf_riscv_gemv_q4x_shard(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k, int j0, int j1);
+void tf_riscv_gemm_q4x_shard(const int8_t *xa, const float *xs, const void *w, float *out, int m, int n, int k, int j0, int j1);
+
+// The two kernel families behind the dispatch, plus the scalar oracle.
+void tf_riscv_gemv_q4x_ime2(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k, int j0, int j1);
+void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_gemv_q4x_float(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k, int j0, int j1);
+void tf_riscv_gemm_q4x_float(const int8_t *xa, const float *xs, const void *w, float *out, int m, int n, int k, int j0, int j1);
+void tf_riscv_gemv_q4x_shard_scalar(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k, int j0, int j1);
+void tf_riscv_gemm_q4x_shard_scalar(const int8_t *xa, const float *xs, const void *w, float *out, int m, int n, int k, int j0, int j1);
+
+// ---- worker scratch and K3 local-memory placement -------------------------
+//
+// tf_riscv_scratch returns per-worker scratch that is stable until the next
+// call: inside an A100 tile it is carved from TCM (the K3 AI cores' 393 KiB
+// local SRAM), otherwise it is a per-thread malloc buffer.
+void *tf_riscv_scratch(size_t bytes);
+size_t tf_riscv_tcm_bytes(void);   // TCM arena this process obtained (0 = none)
+size_t tf_riscv_tcm_used(void);    // peak bytes handed out by tf_riscv_scratch
+
+// Weight arena: anonymous pages with MADV_HUGEPAGE (the vendor's HPAGE
+// backend), 2 MiB aligned. tf_riscv_hpage_available reports whether THP is
+// enabled on this kernel.
+void *tf_riscv_hpage_alloc(size_t bytes);
+void tf_riscv_hpage_free(void *p, size_t bytes);
+int tf_riscv_hpage_available(void);
+size_t tf_riscv_hpage_backed(const void *p);
+size_t tf_riscv_hpage_bytes(void);
+
+// ---- A100 dispatch --------------------------------------------------------
+//
+// tf_riscv_pool_mode("auto"|"x100"|"a100") picks where the sharded kernels
+// run: the X100 cores through a pthread pool, or the A100 AI cores through
+// SpacemiT's spine runtime (libspert), eight tiles per call. "auto" is
+// TF_RISCV_A100=1/0 or x100 by default.
+int tf_riscv_pool_mode(const char *mode);
+const char *tf_riscv_pool_mode_name(void);
+int tf_riscv_a100_available(void);
+
 #ifdef __cplusplus
 }
 #endif

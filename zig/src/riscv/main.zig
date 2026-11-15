@@ -12,6 +12,7 @@ const std = @import("std");
 const kernels = @import("kernels.zig");
 const blas = @import("blas.zig");
 const pool = @import("pool.zig");
+const hpage = @import("hpage.zig");
 const qwen3 = @import("qwen3.zig");
 const tokenizer = @import("tokenizer");
 const build_info = @import("riscv_build");
@@ -69,6 +70,9 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         if (std.mem.eql(u8, args[i], "--kernels") and i + 1 < args.len) {
             i += 1;
             pick = args[i];
+        } else if (std.mem.eql(u8, args[i], "--pool") and i + 1 < args.len) {
+            i += 1;
+            if (!pool.setMode(args[i])) fail("caps: --pool needs auto, x100 or a100", .{});
         } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch fail("--threads needs a number", .{});
@@ -87,6 +91,10 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         \\vlen_bits: {d}
         \\threads: {d}
         \\blas: {s}
+        \\pool: {s}
+        \\tcm_bytes: {d}
+        \\hpage_bytes: {d}
+        \\hpage_available: {}
         \\cap_rvv: {}
         \\cap_ime1: {}
         \\cap_ime2: {}
@@ -97,6 +105,10 @@ fn capsCommand(init: std.process.Init, args: []const [:0]const u8) !u8 {
         kernels.vlenBits(),
         pool.active(),
         blas.name(),
+        pool.modeName(),
+        kernels.c.tf_riscv_tcm_bytes(),
+        hpage.bytes(),
+        hpage.available(),
         caps & kernels.Cap.rvv != 0,
         caps & kernels.Cap.ime1 != 0,
         caps & kernels.Cap.ime2 != 0,
@@ -126,7 +138,7 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             continue;
         }
         const key = a[2..];
-        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report") or std.mem.eql(u8, key, "threads") or std.mem.eql(u8, key, "cpus");
+        var known = std.mem.eql(u8, key, "kernels") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "report") or std.mem.eql(u8, key, "threads") or std.mem.eql(u8, key, "cpus") or std.mem.eql(u8, key, "pool") or std.mem.eql(u8, key, "mem") or std.mem.eql(u8, key, "tcm-kb");
         for (extras) |e| known = known or std.mem.eql(u8, e, key);
         if (!known) fail("unknown flag --{s}", .{key});
         if (i + 1 >= args.len) fail("--{s} needs a value", .{key});
@@ -144,6 +156,18 @@ fn parseCommon(gpa: std.mem.Allocator, args: []const [:0]const u8, comptime extr
             blas.setThreads(@intCast(n));
         } else if (std.mem.eql(u8, key, "cpus")) {
             if (kernels.c.tf_riscv_bind_cpus(args[i].ptr) != 0) fail("cannot pin to CPUs {s}", .{args[i]});
+        } else if (std.mem.eql(u8, key, "pool")) {
+            if (!pool.setMode(args[i])) fail("--pool needs auto, x100 or a100 (a100 needs libspert.so.1)", .{});
+        } else if (std.mem.eql(u8, key, "mem")) {
+            if (std.mem.eql(u8, args[i], "hpage")) {
+                hpage_weights = true;
+                qwen3.hpage_weights = true;
+            } else if (std.mem.eql(u8, args[i], "plain")) {
+                hpage_weights = false;
+                qwen3.hpage_weights = false;
+            } else fail("--mem needs hpage or plain", .{});
+        } else if (std.mem.eql(u8, key, "tcm-kb")) {
+            _ = setenv("TF_RISCV_TCM_KB", args[i], 1);
         } else {
             common.values.put(gpa, key, args[i]) catch unreachable;
         }
@@ -186,7 +210,12 @@ fn writeReport(init: std.process.Init, path: ?[]const u8, body: []const u8) !voi
     try file.writeStreamingAll(init.io, body);
 }
 
-/// Load-time weight quantization: --quant none|q8_0|q4_0.
+/// Where the model's weights live: --mem hpage (MADV_HUGEPAGE arena) or plain.
+pub var hpage_weights = true;
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// Load-time weight quantization: --quant none|q8_0|q4_0|q4x.
 fn setQuant(v: ?[]const u8) void {
     const name = v orelse "none";
     qwen3.quant = if (std.mem.eql(u8, name, "none"))
@@ -195,8 +224,10 @@ fn setQuant(v: ?[]const u8) void {
         .q8_0
     else if (std.mem.eql(u8, name, "q4_0"))
         .q4_0
+    else if (std.mem.eql(u8, name, "q4x"))
+        .q4x
     else
-        fail("--quant needs none, q8_0 or q4_0", .{});
+        fail("--quant needs none, q8_0, q4_0 or q4x", .{});
 }
 
 /// One prompt row's logits as decimal text (the parity oracle reads them).
@@ -296,6 +327,10 @@ fn runCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:0]
         .threads = pool.active(),
         .blas = blas.name(),
         .quant = @tagName(qwen3.quant),
+        .pool = pool.modeName(),
+        .hpage_arena_bytes = hpage.bytes(),
+        .hpage_backed_bytes = hpage.backed(),
+        .tcm_peak_bytes = kernels.c.tf_riscv_tcm_used(),
         .prompt_tokens = prompt_ids.len,
         .generated = generated.items.len,
         .prefill_seconds = prefill_s,
@@ -361,6 +396,10 @@ fn benchCommand(init: std.process.Init, gpa: std.mem.Allocator, args: []const [:
         .threads = pool.active(),
         .blas = blas.name(),
         .quant = @tagName(qwen3.quant),
+        .pool = pool.modeName(),
+        .hpage_arena_bytes = hpage.bytes(),
+        .hpage_backed_bytes = hpage.backed(),
+        .tcm_peak_bytes = kernels.c.tf_riscv_tcm_used(),
         .prefill_tokens = prefill_n,
         .prefill_seconds = prefill_s,
         .prefill_tok_s = @as(f64, @floatFromInt(prefill_n)) / @max(prefill_s, 1e-9),

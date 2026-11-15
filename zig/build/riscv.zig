@@ -24,6 +24,9 @@ const std = @import("std");
 /// no -Werror: this host's clang warns about its dual GCC installs at :1:1).
 const cflags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra", "-ffp-contract=off" };
 
+/// cflags plus the marker that this translation unit carries the IME2 kernels.
+const ime2_kernel_cflags = cflags ++ .{"-DTF_RISCV_Q4X_IME2"};
+
 /// rv64gc (scalar baseline) or rv64gcv (RVV 1.0) for `abi`'s Linux.
 fn riscvTarget(b: *std.Build, v: bool, abi: std.Target.Abi) std.Build.ResolvedTarget {
     const feats = if (v)
@@ -56,6 +59,9 @@ fn kernelModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     mod.addIncludePath(b.path("zig/kernels/riscv"));
     mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
     mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/pool.c"), .flags = &cflags });
+    mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/mem.c"), .flags = &cflags });
+    mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/q4x.c"), .flags = &cflags });
+    mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/q4x_ime2.c"), .flags = &cflags });
     if (wantsV(target)) {
         // IME2 with its inlined reference MMA: the tests exercise the tiling
         // and dispatch under qemu at VLEN=256 and VLEN=1024. dispatch.c must
@@ -98,12 +104,16 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         for ([_][]const u8{ "256", "1024" }) |vlen| {
             const run = b.addSystemCommand(&.{qemu});
             run.addArgs(&.{ "-cpu", b.fmt("rv64,v=true,vlen={s}", .{vlen}) });
+            // qemu does not implement SpacemiT's vmadot, so the q4x family runs
+            // its portable float path here; the IME2 path is hardware-only.
+            run.setEnvironmentVariable("TF_RISCV_Q4X", "float");
             run.addArtifactArg(rvv_tests);
             step.dependOn(&run.step);
             // The scalar family must stay correct inside an RVV build too.
             const run_scalar = b.addSystemCommand(&.{qemu});
             run_scalar.addArgs(&.{ "-cpu", b.fmt("rv64,v=true,vlen={s}", .{vlen}) });
             run_scalar.setEnvironmentVariable("TF_RISCV_KERNELS", "scalar");
+            run_scalar.setEnvironmentVariable("TF_RISCV_Q4X", "float");
             run_scalar.addArtifactArg(rvv_tests);
             step.dependOn(&run_scalar.step);
         }
@@ -141,6 +151,8 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
         mod.addIncludePath(b.path("zig/kernels/riscv"));
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_scalar.c"), .flags = &cflags });
         mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/pool.c"), .flags = &cflags });
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/mem.c"), .flags = &cflags });
+        mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/q4x.c"), .flags = &cflags });
         const ime2_inline = b.option(bool, "riscv-ime2-inline", "Compile the IME2 reference MMA into the CLI (correctness bring-up; the vendor runtime is the production path)") orelse false;
         if (wantsV(cli_target)) {
             var ime2_flags: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -148,6 +160,7 @@ pub fn steps(b: *std.Build, test_step: *std.Build.Step, target: std.Build.Resolv
             mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = ime2_flags.items });
             mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ops_rvv.c"), .flags = &cflags });
             mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/ime2.c"), .flags = ime2_flags.items });
+            mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/q4x_ime2.c"), .flags = &cflags });
         } else {
             mod.addCSourceFile(.{ .file = b.path("zig/kernels/riscv/dispatch.c"), .flags = &cflags });
         }

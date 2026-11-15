@@ -151,3 +151,33 @@ pub fn gemvQ40(x: []const f64, w: []const u8, out: []f64, n: usize, k: usize) vo
         out[j] = s;
     }
 }
+
+/// out[n] = x[k] . w[n,k]^T over q4x's IME2 tile layout: per 8 output rows,
+/// (k/256) groups x 8 f16 scales then k/32 tiles of 128 bytes, where byte t
+/// holds w[r0 + t/16][k0 + t%16] (low nibble) and [k0 + 16 + t%16] (high).
+/// `row` selects the activation row of `x` the call is for (0 for decode).
+pub fn gemvQ4x(x: []const f64, w: []const u8, out: []f64, n: usize, k: usize, row: usize) void {
+    const groups = k / 256;
+    const block_bytes = 4 * k + k / 16;
+    for (0..n) |j| {
+        const block = w[(j / 8) * block_bytes ..];
+        const tiles = block[groups * 8 * 2 ..];
+        const r = j % 8;
+        var acc: f64 = 0;
+        for (0..groups) |g| {
+            const sh = std.mem.readInt(u16, block[g * 16 + r * 2 ..][0..2], .little);
+            const d = halfToF64(sh);
+            var isum: f64 = 0;
+            for (0..8) |c| {
+                const tile = tiles[(g * 8 + c) * 128 + r * 16 ..][0..16];
+                for (0..16) |u| {
+                    const b = tile[u];
+                    isum += (@as(f64, @floatFromInt(b & 0x0f)) - 8.0) * x[row * k + (g * 8 + c) * 32 + u];
+                    isum += (@as(f64, @floatFromInt(b >> 4)) - 8.0) * x[row * k + (g * 8 + c) * 32 + 16 + u];
+                }
+            }
+            acc += isum * d;
+        }
+        out[j] = acc;
+    }
+}

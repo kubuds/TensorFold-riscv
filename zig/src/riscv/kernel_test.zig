@@ -359,3 +359,80 @@ test "riscv kernels: q8_0 and q4_0 GEMV against the float64 reference" {
         }
     }
 }
+
+test "riscv kernels: q4x GEMV and prefill GEMM against the float64 reference" {
+    const a = t.allocator;
+    for ([_]usize{ 256, 512, 768 }) |k| {
+        for ([_]usize{ 8, 16, 40 }) |n| {
+            const m = 40;
+            const rng_seed: u64 = k * 100 + n;
+            const x = try a.alloc(f32, m * k);
+            defer a.free(x);
+            fill(x, rng_seed);
+            const xa = try a.alloc(i8, ((m + 7) / 8) * 8 * k);
+            defer a.free(xa);
+            const xs = try a.alloc(f32, m * (k / 256));
+            defer a.free(xs);
+            c.tf_riscv_quant_a(x.ptr, xa.ptr, xs.ptr, @intCast(m), @intCast(k));
+
+            const rb = c.tf_riscv_q4x_block_bytes(@intCast(k));
+            const w = try a.alloc(u8, (n / 8) * rb);
+            defer a.free(w);
+            var prng: std.Random.DefaultPrng = .init(rng_seed);
+            var rnd = prng.random();
+            for (w) |*v| v.* = rnd.int(u8);
+            for (0..(n / 8) * (k / 256) * 8) |g| { // finite f16 group scales
+                std.mem.writeInt(u16, w[g * 2 ..][0..2], 0x3400 | @as(u16, @intCast(g & 0xFF)), .little);
+            }
+
+            // The kernels compute with the int8-quantized activations, so the
+            // oracle gets exactly those values dequantized (the remaining
+            // difference is f32 vs f64 accumulation).
+            const xf = try a.alloc(f64, m * k);
+            defer a.free(xf);
+            for (0..m) |i| {
+                for (0..k / 256) |g| {
+                    const inv: f64 = if (xs[i * (k / 256) + g] > 0) 1.0 / @as(f64, xs[i * (k / 256) + g]) else 0;
+                    for (0..256) |q| {
+                        const v: f64 = x[i * k + g * 256 + q];
+                        var qi: i32 = 0;
+                        if (inv > 0) qi = @intFromFloat(@round(v * inv));
+                        qi = @max(-127, @min(127, qi));
+                        xf[i * k + g * 256 + q] = @as(f64, @floatFromInt(qi)) * @as(f64, xs[i * (k / 256) + g]);
+                    }
+                }
+            }
+            const want = try a.alloc(f64, n);
+            defer a.free(want);
+            const got = try a.alloc(f32, n);
+            defer a.free(got);
+
+            // Decode: activation row 0, the public GEMV entry.
+            c.tf_riscv_quant_a(x.ptr, xa.ptr, xs.ptr, 1, @intCast(k));
+            ref.gemvQ4x(xf, w, want, n, k, 0);
+            c.tf_riscv_gemv_q4x_shard(xa.ptr, xs.ptr, w.ptr, got.ptr, @intCast(n), @intCast(k), 0, @intCast(n));
+            try expectClose(got, want, 1e-2, 1e-3);
+            c.tf_riscv_gemv_q4x_shard_scalar(xa.ptr, xs.ptr, w.ptr, got.ptr, @intCast(n), @intCast(k), 0, @intCast(n));
+            try expectClose(got, want, 1e-2, 1e-3);
+
+            // Prefill: every row of the GEMM equals the float64 oracle for
+            // that row, and the kernel families agree with each other.
+            c.tf_riscv_quant_a(x.ptr, xa.ptr, xs.ptr, @intCast(m), @intCast(k));
+            const gott = try a.alloc(f32, m * n);
+            defer a.free(gott);
+            const gots = try a.alloc(f32, m * n);
+            defer a.free(gots);
+            for (0..n) |j0| {
+                c.tf_riscv_gemm_q4x_shard(xa.ptr, xs.ptr, w.ptr, gott.ptr, @intCast(m), @intCast(n), @intCast(k), @intCast(j0), @intCast(j0 + 1));
+                c.tf_riscv_gemm_q4x_shard_scalar(xa.ptr, xs.ptr, w.ptr, gots.ptr, @intCast(m), @intCast(n), @intCast(k), @intCast(j0), @intCast(j0 + 1));
+            }
+            // Compare a whole row at a time: single logits of a synthetic
+            // random dot cancel heavily, so the tolerance scales with the row.
+            for (0..m) |i| {
+                ref.gemvQ4x(xf, w, want, n, k, i);
+                try expectClose(gott[i * n ..][0..n], want, 1e-2, 1e-3);
+                try expectClose(gots[i * n ..][0..n], want, 1e-2, 1e-3);
+            }
+        }
+    }
+}

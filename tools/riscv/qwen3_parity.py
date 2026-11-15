@@ -18,9 +18,17 @@ import sys
 
 import numpy as np
 
-SPEC = dict(hidden=32, inter=64, layers=2, heads=4, kv_heads=2, head_dim=8, vocab=97)
+# Small dense Qwen3: the f32/q8_0/q4_0 runs use it as-is. q4x needs K to be a
+# multiple of its 256-value group, so --spec q4x grows hidden/head_dim: matmul
+# K values are hidden (256), inter (512) and heads*head_dim (256).
+SPECS = {
+    "small": dict(hidden=32, inter=64, layers=2, heads=4, kv_heads=2, head_dim=8, vocab=97),
+    "q4x": dict(hidden=256, inter=512, layers=2, heads=4, kv_heads=2, head_dim=64, vocab=97),
+}
+SPEC = SPECS["small"]
 EPS = 1e-6
 THETA = 1e6
+AQ = False  # q4x quantizes activations to int8; the oracle mirrors it
 
 
 def write_safetensors(path, tensors):
@@ -40,10 +48,10 @@ def write_safetensors(path, tensors):
         f.write(data)
 
 
-def build_checkpoint(work):
+def build_checkpoint(work, spec=None):
     os.makedirs(work, exist_ok=True)
     rng = np.random.default_rng(20261115)
-    s = SPEC
+    s = spec or SPEC
     w = {}
     w["model.embed_tokens.weight"] = rng.uniform(-0.5, 0.5, (s["vocab"], s["hidden"])).astype(np.float32)
     w["model.norm.weight"] = rng.uniform(0.5, 1.5, (s["hidden"],)).astype(np.float32)
@@ -92,6 +100,21 @@ def dequantized(w, mode):
         return w.astype(np.float64)
     out = np.empty_like(w, dtype=np.float64)
     last = w.shape[-1]
+    if mode == "q4x":
+        # One f16 scale per 256 weights, d = amax/7, q = round(w/d)+8 on
+        # [1,15] (zero is exactly 8). Mirrors `quantizeQ4x` in qwen3.zig.
+        assert last % 256 == 0
+        flat = w.reshape(-1, last)
+        outf = out.reshape(-1, last)
+        for r in range(flat.shape[0]):
+            for g in range(last // 256):
+                blk = flat[r, g * 256 : (g + 1) * 256].astype(np.float64)
+                amax = np.abs(blk).max()
+                d = amax / 7.0
+                d16 = float(np.float16(d))
+                q = np.clip(round_half_away(blk / d) + 8 if d > 0 else 8, 1, 15)
+                outf[r, g * 256 : (g + 1) * 256] = (q - 8) * d16
+        return out
     assert last % 32 == 0
     flat = w.reshape(-1, last)
     outf = out.reshape(-1, last)
@@ -109,6 +132,24 @@ def dequantized(w, mode):
                 d16 = float(np.float16(d))
                 q = np.clip(round_half_away(blk / d) + 8 if d > 0 else 8, 0, 15)
                 outf[r, b * 32 : (b + 1) * 32] = (q - 8) * d16
+    return out
+
+
+def quant_activation(x):
+    """int8 per 256-value group, the activation side of every q4x projection
+    (d = amax/127, q = round(x/d) on [-127,127], value = q*d with d as f16).
+    Decode and prefill share this because both feed vmadot's int8 A operand."""
+    k = x.shape[-1]
+    if k % 256 != 0:
+        return x
+    out = x.astype(np.float64).copy()
+    for r in range(x.shape[0]):
+        for g in range(k // 256):
+            blk = x[r, g * 256 : (g + 1) * 256].astype(np.float64)
+            amax = np.abs(blk).max()
+            d = float(np.float16(amax / 127.0))
+            if d > 0:
+                out[r, g * 256 : (g + 1) * 256] = np.clip(np.round(blk / d), -127, 127) * d
     return out
 
 
@@ -137,9 +178,10 @@ def forward(w, ids):
     for li in range(s["layers"]):
         p = f"model.layers.{li}."
         normed = np.array([rmsnorm(x[t], w[p + "input_layernorm.weight"]) for t in range(T)])
-        q = normed @ w[p + "self_attn.q_proj.weight"].T.astype(np.float64)
-        k = normed @ w[p + "self_attn.k_proj.weight"].T.astype(np.float64)
-        v = normed @ w[p + "self_attn.v_proj.weight"].T.astype(np.float64)
+        a = quant_activation(normed) if AQ else normed
+        q = a @ w[p + "self_attn.q_proj.weight"].T.astype(np.float64)
+        k = a @ w[p + "self_attn.k_proj.weight"].T.astype(np.float64)
+        v = a @ w[p + "self_attn.v_proj.weight"].T.astype(np.float64)
         cache_k, cache_v = [], []
         attn = np.zeros_like(q)
         for t in range(T):
@@ -163,15 +205,16 @@ def forward(w, ids):
                 pr = np.exp(scores)
                 pr /= pr.sum()
                 attn[t, h * s["head_dim"] : (h + 1) * s["head_dim"]] = pr @ vv
-        x = x + attn @ w[p + "self_attn.o_proj.weight"].T.astype(np.float64)
+        x = x + (quant_activation(attn) if AQ else attn) @ w[p + "self_attn.o_proj.weight"].T.astype(np.float64)
         normed = np.array([rmsnorm(x[t], w[p + "post_attention_layernorm.weight"]) for t in range(T)])
-        gate = normed @ w[p + "mlp.gate_proj.weight"].T.astype(np.float64)
-        up = normed @ w[p + "mlp.up_proj.weight"].T.astype(np.float64)
+        a2 = quant_activation(normed) if AQ else normed
+        gate = a2 @ w[p + "mlp.gate_proj.weight"].T.astype(np.float64)
+        up = a2 @ w[p + "mlp.up_proj.weight"].T.astype(np.float64)
         act = (gate / (1.0 + np.exp(-gate))) * up
-        x = x + act @ w[p + "mlp.down_proj.weight"].T.astype(np.float64)
+        x = x + (quant_activation(act) if AQ else act) @ w[p + "mlp.down_proj.weight"].T.astype(np.float64)
     out = np.array([rmsnorm(x[t], w["model.norm.weight"]) for t in range(T)])
     head = w.get("__head__", w["model.embed_tokens.weight"])
-    return out @ head.T.astype(np.float64)
+    return (quant_activation(out) if AQ else out) @ head.T.astype(np.float64)
 
 
 def main():
@@ -180,11 +223,15 @@ def main():
     ap.add_argument("--work", default=".zig-cache/riscv-parity")
     ap.add_argument("--tokens", default="3,14,1,5,9,2,6")
     ap.add_argument("--generate", type=int, default=8)
-    ap.add_argument("--quant", default="none", choices=["none", "q8_0", "q4_0"])
+    ap.add_argument("--quant", default="none", choices=["none", "q8_0", "q4_0", "q4x"])
+    ap.add_argument("--spec", default="small", choices=sorted(SPECS))
     args = ap.parse_args()
 
     ids = [int(x) for x in args.tokens.split(",")]
-    w = build_checkpoint(args.work)
+    global SPEC, AQ
+    SPEC = SPECS[args.spec]
+    AQ = args.quant == "q4x"
+    w = build_checkpoint(args.work, SPEC)
     if args.quant != "none":
         wq = {}
         for name, arr in w.items():
@@ -226,7 +273,12 @@ def main():
     margin = np.sort(ref_row)[-1] - np.sort(ref_row)[-2]
     print(f"logits: top-1 margin {margin:.3e} (must exceed the tolerance for a meaningful token check)")
 
-    ok = err <= 1e-3 * scale + 1e-4 and margin > 1e-3 * scale + 1e-4
+    # q4x also quantizes activations to int8 (the vmadot A operand), and the
+    # oracle can only approximate the kernel's per-group rounding at the LSB;
+    # its logits therefore carry the quantization noise of an independent
+    # int8 round trip. Greedy tokens stay the hard gate for that path.
+    tol = (5e-2 if args.quant == "q4x" else 1e-3) * scale + 1e-4
+    ok = err <= tol and margin > 1e-3 * scale + 1e-4
     # Token parity via a run with a report.
     report_path = os.path.join(args.work, "zig_report.json")
     proc2 = subprocess.run(cmd + ["--report", report_path], capture_output=True, text=True)

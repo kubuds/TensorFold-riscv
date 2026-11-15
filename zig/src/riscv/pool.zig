@@ -10,6 +10,9 @@ pub const Task = *const fn (ctx: ?*anyopaque, begin: c_int, end: c_int) callconv
 pub extern "C" fn tf_riscv_pool_init(threads: c_int) c_int;
 pub extern "C" fn tf_riscv_pool_run(task: Task, ctx: ?*anyopaque, items: c_int) void;
 pub extern "C" fn tf_riscv_pool_stop() void;
+pub extern "C" fn tf_riscv_pool_mode(mode: [*:0]const u8) c_int;
+pub extern "C" fn tf_riscv_pool_mode_name() [*:0]const u8;
+pub extern "C" fn tf_riscv_pool_active() c_int;
 
 var threads: c_int = 1;
 
@@ -21,7 +24,16 @@ pub fn init(n: usize) usize {
 }
 
 pub fn active() usize {
-    return @intCast(threads);
+    return @intCast(tf_riscv_pool_active());
+}
+
+/// Placement of the shard work: "x100" pthreads, or "a100" through libspert.
+pub fn setMode(name: [:0]const u8) bool {
+    return tf_riscv_pool_mode(name.ptr) >= 0;
+}
+
+pub fn modeName() []const u8 {
+    return std.mem.span(tf_riscv_pool_mode_name());
 }
 
 /// Parallel-for over [0, items) in disjoint shards; inline when the pool is

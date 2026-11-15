@@ -48,9 +48,32 @@ tensorfold-riscv run MODEL --prompt "..." --max-tokens 128 --report run.json
 tensorfold-riscv bench MODEL --prefill 512 --decode 128 --cpus 0-7 --report bench.json
 ```
 
-`--quant q8_0|q4_0` quantizes the projections at load (GGUF q8_0/q4_0
-blocks, f16 scales); measured on K3 the q8_0 path is the fastest decode
-(11.7 tok/s, see the performance report).
+`--quant q8_0|q4_0|q4x` quantizes the projections at load. `q4x` is the K3
+path: 4-bit weights packed in SpacemiT IME2 dot tiles (8 output rows x 32 k
+per 128 bytes, f16 scales per 256-value group, 4.0625 bits per weight) with
+int8 activations per 256-value group, so the IME2 `vmadot` kernel and the
+portable float kernel read the same bytes. See
+[the port report](../riscv-k3-ime2-port.md).
+
+`--pool auto|x100|a100` picks where the sharded kernels run: the X100 cores
+through the pthread pool (default), or the A100 tiles through SpacemiT's spine
+runtime (`libspert.so.1`, checked out once per process). `--mem hpage|plain`
+places the model arena in `MADV_HUGEPAGE` pages (the vendor's `mem_backend:
+HPAGE`; 30.0 -> 40.5 GB/s on the A100 tiles with the probe). `--tcm-kb N`
+caps the per-tile TCM arena (default 320 KiB); `TF_RISCV_TCM=0` disables it,
+`TF_RISCV_TCM_CACHE=0` releases it after every tile.
+
+Measured on the K3 with Qwen3-0.6B, `--quant q4x --pool a100 --mem hpage`
+([performance report](../riscv-k3-performance.md)): tg64 24.6 tok/s,
+tg128 18.3 tok/s, pp64 31.1 tok/s, pp512 42.3 tok/s. `TF_RISCV_Q4X=scalar`
+or `=float` selects the q4x kernel family explicitly (the IME2 path is chosen
+when the CPU reports VLEN=1024).
+
+`tools/riscv/probe_k3.c` measures the machine itself: streaming read bandwidth
+(X100 threads vs A100 spine tiles, 4 KiB vs THP), spine dispatch cost, and the
+`vmadot` contract and throughput. Build it on the K3 with
+`gcc -O3 -march=rv64gcv_xsmtvdotii -mtune=spacemit-a100 probe_k3.c -o probe_k3
+-lspert -lpthread`.
 
 `--cpus LIST` pins the process (K3: `0-7` X100, `8-15` A100); `--threads N`
 sets OpenBLAS workers; `--kernels scalar|rvv|ime2` forces a family;

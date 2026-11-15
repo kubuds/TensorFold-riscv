@@ -24,6 +24,30 @@ pub const c = struct {
     pub extern "C" fn tf_riscv_gemv_q4_0(x: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
     pub extern "C" fn tf_riscv_matmul_q8_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
     pub extern "C" fn tf_riscv_matmul_q4_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+
+    // q4x: 4-bit weights in IME2 dot tiles (zig/kernels/riscv/q4x.c).
+    pub extern "C" fn tf_riscv_q4x_block_bytes(k: c_int) usize;
+    pub extern "C" fn tf_riscv_q4x_row_bytes(k: c_int) usize;
+    pub extern "C" fn tf_riscv_q4x_ok(k: c_int) c_int;
+    pub extern "C" fn tf_riscv_quant_a(x: [*]const f32, xa: [*]i8, xs: [*]f32, m: c_int, k: c_int) void;
+    pub extern "C" fn tf_riscv_gemv_q4x(xa: [*]const i8, xs: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
+    pub extern "C" fn tf_riscv_gemv_q4x_shard(xa: [*]const i8, xs: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_gemm_q4x_shard(xa: [*]const i8, xs: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_gemv_q4x_shard_scalar(xa: [*]const i8, xs: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+    pub extern "C" fn tf_riscv_gemm_q4x_shard_scalar(xa: [*]const i8, xs: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
+
+    // K3 placement: A100 tiles through libspert, TCM scratch, HPAGE weights.
+    pub extern "C" fn tf_riscv_pool_mode(mode: [*:0]const u8) c_int;
+    pub extern "C" fn tf_riscv_pool_mode_name() [*:0]const u8;
+    pub extern "C" fn tf_riscv_pool_active() c_int;
+    pub extern "C" fn tf_riscv_a100_available() c_int;
+    pub extern "C" fn tf_riscv_tcm_bytes() usize;
+    pub extern "C" fn tf_riscv_tcm_used() usize;
+    pub extern "C" fn tf_riscv_hpage_alloc(bytes: usize) ?*anyopaque;
+    pub extern "C" fn tf_riscv_hpage_free(p: ?*anyopaque, bytes: usize) void;
+    pub extern "C" fn tf_riscv_hpage_available() c_int;
+    pub extern "C" fn tf_riscv_hpage_backed(p: ?*const anyopaque) usize;
+    pub extern "C" fn tf_riscv_hpage_bytes() usize;
 };
 
 pub const Cap = struct {

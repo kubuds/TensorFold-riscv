@@ -26,6 +26,9 @@ void tf_riscv_pool_run(tf_riscv_task fn, void *ctx, int items);
 // Stop the workers (idempotent).
 void tf_riscv_pool_stop(void);
 
+// Participants of the current placement (threads, or A100 tiles).
+int tf_riscv_pool_active(void);
+
 #ifdef __cplusplus
 }
 #endif

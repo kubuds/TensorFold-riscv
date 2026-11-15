@@ -15,6 +15,10 @@ const st = @import("safetensors.zig");
 const kernels = @import("kernels.zig");
 const blas = @import("blas.zig");
 const pool = @import("pool.zig");
+const hpage = @import("hpage.zig");
+
+/// Place the model arena in the K3 huge-page weight arena (--mem hpage).
+pub var hpage_weights = true;
 
 const c = kernels.c;
 
@@ -31,15 +35,17 @@ pub const Spec = struct {
     theta: f32,
 };
 
-/// Weight storage: f32/bf16 lanes (row-major [rows, cols]) or GGUF q8_0/
-/// q4_0 blocks (k/32 blocks per row, k % 32 == 0).
-pub const Kind = enum { f32, bf16, q8_0, q4_0 };
+/// Weight storage: f32/bf16 lanes (row-major [rows, cols]), GGUF q8_0/q4_0
+/// blocks (k/32 blocks per row, k % 32 == 0), or q4x - 4-bit weights packed in
+/// SpacemiT's IME2 dot tiles (8 output rows x 32 k per 128 bytes, k % 256).
+pub const Kind = enum { f32, bf16, q8_0, q4_0, q4x };
 
 /// Load-time quantization for the projections (norms stay f32). q8_0: d =
 /// amax/127 rounded to f16, q = round(w/d) in [-127,127]; q4_0: d = amax/8
-/// to f16, q = round(w/d)+8 in [0,15]. tools/riscv/qwen3_parity.py applies
+/// to f16, q = round(w/d)+8 in [0,15]; q4x: one f16 scale per 256 weights,
+/// d = amax/7, q = round(w/d)+8 in [-7,7]. tools/riscv/qwen3_parity.py applies
 /// the same convention and compares logits.
-pub const Quant = enum { none, q8_0, q4_0 };
+pub const Quant = enum { none, q8_0, q4_0, q4x };
 
 /// The quantization `Model.load` applies to 2-D projection weights.
 pub var quant: Quant = .none;
@@ -64,6 +70,7 @@ pub const Weight = struct {
         return switch (w.kind) {
             .q8_0 => (w.cols / 32) * 34,
             .q4_0 => (w.cols / 32) * 18,
+            .q4x => c.tf_riscv_q4x_row_bytes(@intCast(w.cols)),
             else => w.cols * 4,
         };
     }
@@ -105,6 +112,31 @@ pub const Model = struct {
     pub fn project(m: *const Model, w: Weight, x: []const f32, out: []f32, rows: usize) void {
         _ = m;
         switch (w.kind) {
+            .q4x => {
+                // q4x: weights live in IME2 dot tiles and activations are
+                // quantized to int8 per 256-value group, so decode (one row)
+                // and prefill (m rows) run the same vmadot inner loop.
+                const raw: [*]const u8 = @ptrCast(@alignCast(w.mem.ptr));
+                const groups = w.cols / 256;
+                const pad = q4xActivation(w.cols, rows);
+                c.tf_riscv_quant_a(x.ptr, pad.xa.ptr, pad.xs.ptr, @intCast(rows), @intCast(w.cols));
+                if (rows == 1) {
+                    if (pool.active() > 1) {
+                        var ctx: GemvQ4xCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .raw = raw, .out = out.ptr, .n = w.rows, .k = w.cols };
+                        pool.run(gemvQ4xShard, &ctx, w.rows);
+                        return;
+                    }
+                    c.tf_riscv_gemv_q4x(pad.xa.ptr, pad.xs.ptr, raw, out.ptr, @intCast(w.rows), @intCast(w.cols));
+                    return;
+                }
+                if (pool.active() > 1) {
+                    var ctx: GemmQ4xCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .raw = raw, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols };
+                    pool.run(gemmQ4xShard, &ctx, w.rows);
+                    return;
+                }
+                c.tf_riscv_gemm_q4x_shard(pad.xa.ptr, pad.xs.ptr, raw, out.ptr, @intCast(rows), @intCast(w.rows), @intCast(w.cols), 0, @intCast(w.rows));
+                _ = groups;
+            },
             .bf16 => {
                 if (pool.active() > 1) {
                     var ctx: ProjectCtx = .{ .x = x.ptr, .bf16_lanes = w.bf16Lanes().ptr, .f32_lanes = null, .out = out.ptr, .m = rows, .n = w.rows, .k = w.cols, .bf16 = true };
@@ -142,7 +174,7 @@ pub const Model = struct {
     pub fn tableRow(m: *const Model, w: Weight, row: usize, out: []f32) void {
         _ = m;
         switch (w.kind) {
-            .q8_0, .q4_0 => unreachable, // quantize() never touches the table
+            .q8_0, .q4_0, .q4x => unreachable, // quantize() never touches the table
             .f32 => @memcpy(out, w.f32Lanes()[row * w.cols ..][0..w.cols]),
             .bf16 => {
                 const lanes = w.bf16Lanes()[row * w.cols ..][0..w.cols];
@@ -155,7 +187,8 @@ pub const Model = struct {
     /// their weight map. Every tensor's shape is checked against the config;
     /// a mismatch refuses the checkpoint by name.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Model {
-        var arena: std.heap.ArenaAllocator = .init(gpa);
+        const backing = if (hpage_weights and hpage.available()) hpage.allocator() else gpa;
+        var arena: std.heap.ArenaAllocator = .init(backing);
         errdefer arena.deinit();
         const a = arena.allocator();
 
@@ -223,7 +256,7 @@ pub const Model = struct {
             // logits projection when quantization is on (its own copy).
             m.head = switch (quant) {
                 .none => m.embed,
-                .q8_0, .q4_0 => try quantize(a, m.embed, quant),
+                .q8_0, .q4_0, .q4x => try quantize(a, m.embed, quant),
             };
         }
         m.arena = arena; // refresh the copy: `a` kept allocating into the local
@@ -360,6 +393,7 @@ fn normalize(a: std.mem.Allocator, t: st.Tensor) !Weight {
         .none => w,
         .q8_0 => quantize(a, w, .q8_0),
         .q4_0 => quantize(a, w, .q4_0),
+        .q4x => quantize(a, w, .q4x),
     };
 }
 
@@ -367,12 +401,17 @@ fn normalize(a: std.mem.Allocator, t: st.Tensor) !Weight {
 fn quantize(a: std.mem.Allocator, w: Weight, mode: Quant) !Weight {
     const rows = w.rows;
     const k = w.cols;
+    if (mode == .q4x) {
+        if (k % 256 != 0) return error.QuantShape;
+        return quantizeQ4x(a, w, rows, k);
+    }
     if (k % 32 != 0) return error.QuantShape;
     const blocks = rows * (k / 32);
     const bytes = switch (mode) {
         .none => unreachable,
         .q8_0 => blocks * 34,
         .q4_0 => blocks * 18,
+        .q4x => unreachable,
     };
     const mem = try a.alignedAlloc(u8, .@"8", bytes);
     const src_f32 = w.kind == .f32;
@@ -414,8 +453,72 @@ fn quantize(a: std.mem.Allocator, w: Weight, mode: Quant) !Weight {
             }
         }
     }
-    return .{ .rows = rows, .cols = k, .kind = if (mode == .q8_0) .q8_0 else .q4_0, .mem = mem };
+    const kind: Kind = switch (mode) {
+        .q8_0 => .q8_0,
+        .q4_0 => .q4_0,
+        .q4x => .q4x,
+        .none => unreachable,
+    };
+    return .{ .rows = rows, .cols = k, .kind = kind, .mem = mem };
 }
+
+/// q4x: packed for SpacemiT's IME2 dot, tile by tile (zig/kernels/riscv/q4x.c).
+/// A row block is 8 output rows: (k/256) groups x (8 rows x f16) scales, then
+/// k/32 tiles of 128 bytes, where byte t holds w[r0 + t/16][k0 + t%16] in the
+/// low nibble and w[r0 + t/16][k0 + 16 + t%16] in the high nibble. Values are
+/// signed 4-bit (q in [-7,7], stored as q+8) with d = amax/7 per 256-value
+/// group per row, so one 128-byte load is exactly vmadot's two B operands.
+fn quantizeQ4x(a: std.mem.Allocator, w: Weight, rows: usize, k: usize) !Weight {
+    const groups = k / 256;
+    const block_bytes = 4 * k + k / 16;
+    // Rows are packed in blocks of eight (one IME2 dot tile row group); a
+    // vocabulary that is not a multiple of eight gets zero padding rows that
+    // the kernels compute and the caller never reads.
+    const packed_rows = ((rows + 7) / 8) * 8;
+    const bytes = (packed_rows / 8) * block_bytes;
+    const mem = try a.alignedAlloc(u8, .@"64", bytes);
+    @memset(mem, 0);
+    const src_f32 = w.kind == .f32;
+    for (0..packed_rows / 8) |rb| {
+        const block = mem.ptr + rb * block_bytes;
+        if (rb * 8 >= rows) break; // zero padding rows stay zero
+        const scales: [*]u16 = @ptrCast(@alignCast(block));
+        const tiles = block + groups * 8 * 2;
+        for (0..groups) |g| {
+            for (0..8) |r| {
+                if (rb * 8 + r >= rows) break;
+                const rowbase = (rb * 8 + r) * k;
+                const rowoff = rowbase + g * 256;
+                var amax: f32 = 0;
+                for (0..256) |i| amax = @max(amax, @abs(lane(w, rowoff + i, src_f32)));
+                const d = amax / 7.0;
+                scales[g * 8 + r] = @bitCast(@as(f16, @floatCast(d)));
+                const inv: f32 = if (d > 0) 1.0 / d else 0;
+                for (0..8) |t| {
+                    const kc = g * 8 + t; // 32-k chunk
+                    const tile = tiles + kc * 128;
+                    for (0..16) |u| {
+                        var lo: i32 = 0;
+                        var hi: i32 = 0;
+                        if (d > 0) {
+                            lo = q4xRound(lane(w, rowbase + kc * 32 + u, src_f32), inv);
+                            hi = q4xRound(lane(w, rowbase + kc * 32 + 16 + u, src_f32), inv);
+                        }
+                        lo = @max(-8, @min(7, lo)) + 8;
+                        hi = @max(-8, @min(7, hi)) + 8;
+                        tile[r * 16 + u] = @intCast(lo | (hi << 4));
+                    }
+                }
+            }
+        }
+    }
+    return .{ .rows = rows, .cols = k, .kind = .q4x, .mem = mem };
+}
+
+fn q4xRound(v: f32, inv: f32) i32 {
+    return @as(i32, @intFromFloat(@round(v * inv)));
+}
+
 
 fn lane(w: Weight, idx: usize, src_f32: bool) f32 {
     return if (src_f32) w.f32Lanes()[idx] else @as(f32, @bitCast(@as(u32, w.bf16Lanes()[idx]) << 16));
@@ -530,6 +633,54 @@ fn attnShardRun(a: *AttnCtx, begin: c_int, end: c_int) void {
             c.tf_riscv_attention_f32(a.q[t * qw + h * hd ..].ptr, krows.ptr, vrows.ptr, a.attn[t * qw + h * hd ..].ptr, @intCast(rows), @intCast(hd), a.scale, scratch.ptr);
         }
     }
+}
+
+/// Decode (m == 1) q4x shard: output rows [begin, end) of one projection.
+const GemvQ4xCtx = struct {
+    xa: [*]const i8,
+    xs: [*]const f32,
+    raw: [*]const u8,
+    out: [*]f32,
+    n: usize,
+    k: usize,
+};
+
+fn gemvQ4xShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
+    const p: *GemvQ4xCtx = @ptrCast(@alignCast(ctx.?));
+    c.tf_riscv_gemv_q4x_shard(p.xa, p.xs, p.raw, p.out, @intCast(p.n), @intCast(p.k), begin, end);
+}
+
+/// Prefill (m > 1) q4x shard: output rows [begin, end) of one projection.
+const GemmQ4xCtx = struct {
+    xa: [*]const i8,
+    xs: [*]const f32,
+    raw: [*]const u8,
+    out: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+};
+
+fn gemmQ4xShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
+    const p: *GemmQ4xCtx = @ptrCast(@alignCast(ctx.?));
+    c.tf_riscv_gemm_q4x_shard(p.xa, p.xs, p.raw, p.out, @intCast(p.m), @intCast(p.n), @intCast(p.k), begin, end);
+}
+
+/// Module-level scratch for the quantized activation (int8 tiles plus the
+/// per-row group scales). One session per process, so it is never shared.
+const Activation = struct { xa: []i8, xs: []f32 };
+var act_buf: []align(64) u8 = &.{};
+
+fn q4xActivation(k: usize, rows: usize) Activation {
+    const blocks = (rows + 7) / 8;
+    const need = blocks * 8 * k + rows * (k / 256) * @sizeOf(f32);
+    if (act_buf.len < need) {
+        if (act_buf.len > 0) std.heap.page_allocator.free(act_buf);
+        act_buf = std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(64), need) catch &.{};
+    }
+    const xa = act_buf[0 .. blocks * 8 * k];
+    const xs: []f32 = @alignCast(@as([*]f32, @ptrCast(@alignCast(act_buf.ptr + blocks * 8 * k)))[0 .. rows * (k / 256)]);
+    return .{ .xa = @alignCast(@as([*]i8, @ptrCast(xa.ptr))[0 .. xa.len]), .xs = xs };
 }
 
 /// One projection for the pool's shard trampoline.
@@ -739,4 +890,51 @@ pub fn sampleOne(logits: []const f32, temperature: f32, top_p: f32, rng: std.Ran
         if (roll <= 0) return id;
     }
     return order[kept - 1];
+}
+
+test "qwen3 q4x packing round-trips through the kernel dot" {
+    const t = std.testing;
+    const a = t.allocator;
+    const rows = 16;
+    const k = 512;
+    // A deterministic random weight matrix.
+    var prng: std.Random.DefaultPrng = .init(7);
+    const rnd = prng.random();
+    const src = try a.alloc(f32, rows * k);
+    defer a.free(src);
+    for (src) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
+    const w = Weight{ .rows = rows, .cols = k, .kind = .f32, .mem = std.mem.sliceAsBytes(src) };
+    const packed_w = try quantizeQ4x(a, w, rows, k);
+    defer a.free(@as([]align(64) u8, @alignCast(@constCast(packed_w.mem))));
+
+    // A unit activation at k selects exactly that dequantized weight.
+    const x = try a.alloc(f32, k);
+    defer a.free(x);
+    const xa = try a.alloc(i8, 8 * k);
+    defer a.free(xa);
+    const xs = try a.alloc(f32, k / 256);
+    defer a.free(xs);
+    const out = try a.alloc(f32, rows);
+    defer a.free(out);
+    for (0..k) |kk| {
+        @memset(x, 0);
+        x[kk] = 1.0;
+        c.tf_riscv_quant_a(x.ptr, xa.ptr, xs.ptr, 1, k);
+        c.tf_riscv_gemv_q4x_shard_scalar(xa.ptr, xs.ptr, packed_w.mem.ptr, out.ptr, rows, k, 0, rows);
+        for (0..rows) |r| {
+            // Expected: the same quantization rule the loader applies.
+            var amax: f32 = 0;
+            const g0 = (kk / 256) * 256;
+            for (src[r * k + g0 ..][0..256]) |v| amax = @max(amax, @abs(v));
+            const d: f32 = @floatCast(@as(f16, @floatCast(amax / 7.0)));
+            var q: f32 = 0;
+            if (amax > 0) q = @round(src[r * k + kk] / (amax / 7.0));
+            q = @max(-8, @min(7, q));
+            const want = q * d;
+            if (@abs(out[r] - want) > 1e-3 * @max(@abs(want), 1.0)) {
+                std.debug.print("q4x pack mismatch r={d} k={d}: got {e} want {e}\n", .{ r, kk, out[r], want });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
 }
