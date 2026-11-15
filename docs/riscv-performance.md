@@ -1,135 +1,145 @@
 # RISC-V backend performance report (SpacemiT K3)
 
-All numbers below were measured on the K3 test machine `k3pico16g.local`
-(Bianbu 4.0.8, Linux 6.18.3, 16 GB LPDDR5) with the committed harness and
-receipts; none are estimates. The comparison target is SpacemiT's native
-llama.cpp on the same machine, cores and model.
+All numbers were measured on the K3 test machine `k3pico16g.local` (Bianbu
+4.0.8, Linux 6.18.3, 16 GB LPDDR5) with the committed harness and receipts
+in `~/receipts/` on that machine. **Correction notice**: the first version of
+this report compared against a self-built upstream llama.cpp. The baseline of
+record is the SpacemiT vendor-optimized llama.cpp; both of its sources are
+now measured (section 2), and the comparison below is redone against it.
 
 ## 1. Summary
 
-**Decode (the serving metric): TensorFold beats llama.cpp on this K3.**
-Best configuration, Qwen3-0.6B, X100 cores 0-7, 8 threads:
+Qwen3-0.6B, decode tg128 (the serving metric), all on the K3 SoC:
 
-| | prefill pp512 (tok/s) | decode tg128 (tok/s) |
-| --- | --- | --- |
-| **TensorFold q8_0** | 15.1 | **11.7** |
-| TensorFold bf16 | 15.2 | 8.7 |
-| llama.cpp Q4_K_M (its best decode) | 92.6 | 4.1 |
-| llama.cpp Q8_0 | 65.5 | 3.7 |
-| llama.cpp BF16 (equal format) | 5.9 | 1.9 |
+| engine | placement | prefill pp512 (tok/s) | decode tg128 (tok/s) |
+| --- | --- | --- | --- |
+| **vendor llama.cpp apt 0.2.2, Q4_K_M** | A100 + IME2 + TCM/HPAGE | 326.5 | **40.9** |
+| vendor llama.cpp apt 0.2.2, Q8_0 | A100 + IME2 | 302.2 | 32.0 |
+| vendor llama.cpp apt 0.2.2, BF16 | A100 + IME2 | 2.7 | 1.9 |
+| spacemit-llama.cpp source 27acf9d, Q4_K_M | X100 CPU path | 92.4 | 4.2 |
+| TensorFold q8_0 (this backend) | X100, RVV | 15.1 | 11.7 |
+| TensorFold bf16 | X100, RVV | 15.2 | 8.7 |
+| upstream llama.cpp (self-built), Q4_K_M | X100 CPU path | 92.6 | 4.1 |
 
-- Decode vs llama.cpp's best quantized config: **2.9x** (11.7 vs 4.1 tok/s).
-- Decode vs llama.cpp at equal bf16 format: **4.5x** (8.7 vs 1.9 tok/s).
-- Prefill vs llama.cpp BF16: **2.6x** (15.2 vs 5.9 tok/s).
-- Prefill vs llama.cpp's quantized GEMM: **6x behind** (15.1 vs 92.6). The
-  gap is a kernel-class difference (their repacked quantized GEMM vs our
-  row-dot GEMM) and is the top ledger item, honestly unresolved.
+**Status against the goal (beat the vendor-native llama.cpp): not yet.**
+Decode reaches 29% of the vendor Q4_K_M rate (11.7 vs 40.9); prefill 5%.
+What the gap is made of is measured in section 4 - it is not ISA-luck: the
+vendor path reads 3.7x fewer bytes per token (Q4_K_M repack) at about 2x
+the effective memory rate (TCM/HPAGE tuned streams) and computes prefill
+through IME2 INT MMA tiles. Section 5 is the concrete path to parity.
 
-## 2. Machine and method
+Where we do win (same Qwen3-0.6B, same machine): decode is 4.5x the vendor
+binary's own BF16 path (8.7 vs 1.9 tok/s) and 2.8x the upstream llama.cpp at
+equal format; the vendor's speed comes entirely from its quantized+IME2
+paths, its BF16 fallback is slower than ours.
 
-- CPU: SpacemiT K3, X100 cores 0-7 @ 2.15 GHz (RVV 1.0, VLEN=256), A100
-  cores 8-15 @ 1.8 GHz (VLEN=1024) - see section 6 for the A100 situation.
-- Model: Qwen/Qwen3-0.6B (HF safetensors bf16, 596 M params, 1.5 GB) for
-  TensorFold; unsloth/Qwen3-0.6B-GGUF (BF16/Q8_0/Q4_K_M/Q4_0) for llama.cpp.
-- Workload: `bench --prefill 512 --decode 128 --context 1024`, seeded random
-  ids (identical across machines and kernel families); llama.cpp
-  `llama-bench -p 512 -n 128 -r 2`. Process pinned with `--cpus 0-7` /
-  `taskset -c 0-7`. Receipts: `~/receipts/` on the machine (bench JSONs,
-  `llama-bench.txt`, `caps.txt`, `tests.txt`, `run-*.txt`).
-- Correctness gates on the machine, all green: 14/14 tests (`zig build
-  riscv-test`), and `tools/riscv/qwen3_parity.py` against the independent
-  numpy float64 oracle for `--quant none/q8_0/q4_0` (greedy tokens identical
-  in all three), plus greedy text runs (bf16 and q8_0 produce the same
-  correct continuation: "Paris. The capital of Italy is Rome...").
+## 2. The two vendor sources (as requested)
 
-## 3. Full matrices
+1. **apt baseline**: `llama.cpp-tools-spacemit` 0.2.2 (archive.spacemit.com,
+   resolute-porting/main), binaries `/usr/bin/llama-bench` etc., builder
+   51c81f90f (10056). Startup log: `use_ime2=1`, `cpu_mask: ff00`
+   (compute pinned to the A100 set 8-15), `mem_backend: HPAGE`, TCM
+   available (8 x 393 KiB), device reports `SPACEMIT`. This is the baseline
+   of record. Full matrix (~/receipts/llama-vendor-bench.txt):
 
-### TensorFold (X100, cores 0-7)
+   | quant | pp64 t4 | tg64 t4 | pp512 t8 | tg128 t8 |
+   | --- | --- | --- | --- | --- |
+   | Q4_K_M | 214.9 | 37.3 | 326.5 | 40.9 |
+   | Q8_0 | 200.1 | 30.7 | 302.2 | 32.0 |
+   | BF16 | 1.4 | 1.0 | 2.7 | 1.9 |
 
-| config | prefill 1t | prefill 8t | decode 1t | decode 8t |
-| --- | --- | --- | --- | --- |
-| bf16 | 5.8 | 15.2 | 4.0 | 8.7 |
-| q8_0 | 5.5 | 15.1 | 4.1 | **11.7** |
-| q4_0 | 2.5 | 12.0 | 1.7 | 6.5 |
+2. **source** (kernels' origin): github.com/spacemit-com/llama.cpp, branch
+   mtmd-backend @ 27acf9d (2026-08-05), built natively on K3
+   (~/receipts/llama-source-bench.txt). This commit builds the plain CPU
+   path (no spine runtime): Q4_K_M pp64/tg64 t4 = 64.2/18.6, pp512/tg128
+   t8 = 92.4/4.2. Its newer master carries the spine/IME2 adapter
+   (ggml/src/ggml-cpu/spacemit/*) that the apt package ships.
 
-### llama.cpp (X100, cores 0-7)
+   For direct comparison at the user's methodology (-p 64 -n 64 -t 4):
+   vendor 37.3 tg64, source-build 18.6, TensorFold q8_0 15.3
+   (~/receipts/tensorfold-t4.txt).
 
-| quant | prefill 1t | prefill 8t | decode 1t | decode 8t |
-| --- | --- | --- | --- | --- |
-| BF16 | 0.84 | 5.90 | 0.61 | 1.94 |
-| Q8_0 | 10.87 | 65.50 | 4.84 | 3.71 |
-| Q4_K_M | 15.29 | 92.58 | 5.76 | 4.09 |
-| Q4_0 | 17.96 | 105.47 | 6.93 | 4.18 |
+Method notes: `llama-bench` defaults to its own thread/core placement (the
+vendor binary checks out A100 cores through the spine runtime); TensorFold
+was pinned with --cpus 0-7 on X100 unless noted. A run with the vendor
+binary confirms its workers execute on CPUs 8-15 while the process affinity
+mask still reads 0-7 (threads are placed by the spine runtime, not by
+sched_setaffinity).
 
-Notes from the matrix: llama.cpp's decode does not scale past one thread on
-this SoC either (their Q8_0 tg drops 4.84 -> 3.71 with 8 threads), while
-TensorFold's sharded GEMV scales 2.9x (q8_0, 4.1 -> 11.7). Their prefill
-scales 6x on 8 cores with repacked quantized GEMM kernels; ours scales 2.8x
-on row-dot kernels - the gap in section 1.
+## 3. Correctness (unchanged, all on the machine)
 
-## 4. How the decode numbers were won (session ledger)
+14/14 tests native on K3 and under qemu (rv64gc + rv64gcv at VLEN 256/1024);
+numpy-oracle parity OK for --quant none/q8_0/q4_0 with identical greedy
+tokens; bf16 and q8_0 greedy text runs agree. The hardware gate also caught
+and fixed a real sin/cos precision bug the qemu budget had hidden (2.1e-4
+rope drift -> 1.2e-7).
 
-Every change kept the numpy-oracle gates green (see the commit history):
-1. **Sharded-work thread pool** (`zig/kernels/riscv/pool.c`): projections
-   split output columns across workers; each streams its own sequential
-   weight rows (the K3 paper's LPDDR5 saturation pattern). Deterministic -
-   shards are disjoint, results are bit-identical to serial (tested).
-2. **Attention single-pass + head sharding**: one dot per key row into a
-   score buffer (was three passes) and parallel over the 16 heads. This
-   alone took 8-thread decode from 5.0 to 8.7 tok/s.
-3. **q8_0 load-time quantization** (`--quant q8_0`): halved weight traffic
-   with dequant folded into the FMA chain (one f32 accumulator across
-   blocks, one reduce per row). 11.7 tok/s; the oracle models the exact
-   quantization convention (f16-rounded scale, round-half-away levels).
-4. Micro work kept honest in the kernel ledger: 4-lane accumulator unroll,
-   weight-row prefetch, fast transcendentals for the per-token libm volume.
-   The hardware gate caught a real bug here: the first sin/cos polynomial
-   truncated its Taylor series on [-pi, pi] (5e-5 error near pi) and cast
-   the angle to float early (2e-4 at pos 4096) - invisible in the qemu
-   tolerance budget, a 2.1e-4 rope drift against the scalar oracle on the
-   X100. Quadrant reduction to [-pi/4, pi/4] with a double angle brought
-   the hardware drift to 1.2e-7 (f32 rounding), and the K3-native suite is
-   14/14 again. This is why the report insists on machine receipts.
+## 4. Where the gap comes from (measured)
 
-## 5. Micro receipts (tools/riscv/kernel_bench.c, X100 core 0)
+Per token, Qwen3-0.6B streams: bf16 1.18 GB, q8_0 0.64 GB, Q4_K_M 0.37 GB.
 
-| kernel | 1 thread | 8 threads |
-| --- | --- | --- |
-| gemv_bf16 151936x1024 (lm_head) | 6.4 GB/s | 15.5 GB/s |
-| gemv_bf16 3072x1024 | 6.2 GB/s | 10.6 GB/s |
-| gemm_bf16 64x1024 (prefill tile) | 6.1 GFLOP/s | 13.2 GFLOP/s |
+1. **Bytes per token**: our best decode (q8_0) reads 1.7x the vendor's
+   Q4_K_M. Our q4_0 path is correct but slow (scalar nibble dequant: 6.5
+   tok/s vs q8_0's 11.7), so the deployable quant today is q8_0.
+2. **Effective bandwidth**: our decode reads ~7.5 GB/s end to end (8
+   threads) while the vendor sustains ~15 GB/s (their HPAGE/TCM-tuned
+   streams). Our kernel micro-rate is 15-20 GB/s on big shapes, so the loss
+   is end-to-end shape mix, serial non-GEMV work and per-call overhead -
+   not the raw stream. Together (1) and (2) explain the 3.5x decode gap
+   almost exactly (1.7 x 2.0 = 3.4).
+3. **Prefill**: the vendor computes through IME2 INT MMA tiles on repacked
+   weights (their pp512 Q4_K_M 326 tok/s ~= 395 GFLOP/s equivalent), we use
+   row-dot RVV GEMM (~18 GFLOP/s aggregate). This is a kernel-class gap.
+4. **A100 placement alone does not fix decode** (measured, section 5): it is
+   bandwidth-bound on the same LPDDR5.
 
-The single-core stream (~6.4 GB/s) and the 8-core ceiling (~15 GB/s) frame
-the decode analysis: Qwen3-0.6B streams 1.18 GB (bf16) or 0.64 GB (q8_0) per
-token, so q8_0 decode at 11.7 tok/s reads 7.5 GB/s - the kernel is within
-2x of this machine's measured multi-stream ceiling for the access pattern.
+## 5. Spine/A100 dispatch experiment (done, documented)
 
-## 6. A100 (VLEN=1024, IME2): not measurable from this account
+`zig/kernels/riscv/pool.c` gained a SpacemiT spine mode (TF_RISCV_SPERT=1):
+the sharded projections dispatch to the A100 cores through libspert.so.1's
+stable C ABI (spine_require_stream / spine_parallel_dispatch_1d /
+spine_grid), reimplemented from SpacemiT's own MIT-licensed adapter
+(spacemit-llama.cpp, spacemit_spert_adapter.cpp) with attribution. Findings
+on the machine:
 
-The K3 kernel's scheduling policy binds every thread of a normal process to
-the X100 set at creation and refuses A100 affinity (`sched_setaffinity` to
-CPU 8-15 returns EINVAL; `Cpus_allowed_list: 0-7`; `taskset -c 8` fails).
-This matches the K3 paper's kernel-modified scheduling: AI work must be
-labeled through the SpacemiT runtime, which is not installed (no vendor IME
-runtime or SDK is present on this machine; `/dev/ai_dma` exists but has no
-public userspace ABI). Consequently:
+- The mechanism works: a probe shows tile i executing on CPU 8+i (VLEN=1024),
+  and our kernels run there unchanged (they are VLEN-agnostic).
+- Per-shape on A100: large GEMM is 1.7x faster than the X100 pool (22.1 vs
+  12.8 GFLOP/s), the lm_head GEMV 1.3x (19.8 vs 15.5 GB/s); small shapes are
+  equal. But `spine_parallel_dispatch_1d` costs ~0.6-1.2 ms per call
+  (arbiter round trip; holding the stream does not remove it), and a decode
+  token makes ~197 projection calls, so end-to-end decode got slower
+  (4.7 vs 11.7 tok/s for q8_0).
+- Conclusion: A100 dispatch pays only when calls are fused. The follow-up is
+  a fused per-layer projection task (q/k/v share one dispatch, gate/up one:
+  8 -> 4 dispatches per layer) or one fused task per layer block. Decode
+  would still be bandwidth-bound at ~the same rate; prefill/lm_head are
+  where A100+fusion wins.
+- What actually powers the vendor decode is their INT4/INT8 repacked kernels
+  plus TCM/HPAGE streams, not the core placement (their BF16 path on the
+  same A100 cores is 20x slower than their Q4_K_M).
 
-- VLEN=1024 kernel correctness is covered by the qemu gates
-  (`zig build riscv-qemu-test` runs the whole suite at VLEN=256 and
-  VLEN=1024) and the IME2 family (tiled MMA through the `ime2_abi.h` seam)
-  is regression-tested the same way - but no A100 throughput number exists.
-- To measure: run as root (or through the SpacemiT AI runtime) to bind
-  `--cpus 8-15`, with `TF_RISCV_IME2` pointing at the vendor MMA library.
-  The harness and fill-in procedure are unchanged from the earlier draft.
+## 6. Path to the goal (measured plan, each step has a target number)
 
-## 7. Remaining gaps (each with its plan)
+1. **Q4-class quantization with vectorized dequant** (ours is q8_0 today;
+   their Q4_K_M is 1.7x fewer bytes): target >= 15 tok/s decode closing the
+   bytes gap at our bandwidth.
+2. **Vendor-kernel bridge**: the MIT-licensed spacemit sources
+   (ggml/src/ggml-cpu/spacemit/{ime2_kernels.cpp,repack.cpp,rvv_kernels.cpp})
+   contain the repacked INT GEMM and IME2 asm. Compiling them behind our
+   kernel seam (the libime2bridge.so approach) plus the spine dispatch is
+   the direct route to the vendor's compute class; license-compatible
+   (MIT into Apache-2.0 with attribution).
+3. **Fused per-layer dispatch + A100** for prefill (section 5): target
+   prefill 40-60 tok/s from the 1.7x GEMM gain with 4x fewer dispatches.
+4. **Bandwidth efficiency** (shape mix, prefetch, serial work): target the
+   15 GB/s end-to-end the vendor sustains.
 
-1. **Prefill GEMM**: llama.cpp's repacked quantized GEMM reaches 105 tok/s
-   where our row-dot GEMM reaches 15. Plan: k-outer bf16/q8_0 micro-kernel
-   with i/j blocking (the dot unroll alone moved the needle ~0%: the row-dot
-   structure, not the FMA chain, is the limit), or OpenBLAS for f32 models.
-2. **q4_0 kernel**: scalar nibble dequant per block keeps it behind q8_0
-   (6.5 vs 11.7 tok/s). Plan: vectorize the nibble interleave.
-3. **A100 measurements** (section 6) and real-IME2 tolerances once the
-   vendor runtime is available.
-4. Engine-adapter integration (engine_api/lanes) for `tensorfold serve`.
+## 7. A100 / IME2 access notes
+
+Normal processes cannot bind to CPUs 8-15 (sched_setaffinity/pthread return
+EINVAL, Cpus_allowed_list 0-7; the kernel's AI-domain policy). The spine
+runtime (libspert.so.1) is the sanctioned route and it works (section 5);
+IME2 instructions are only reachable through SpacemiT's kernels, which the
+public MIT sources provide. qemu gates keep VLEN=1024 and the IME2-family
+tiling regression-tested in CI regardless.
