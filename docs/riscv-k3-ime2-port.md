@@ -111,16 +111,17 @@ TF_RISCV_Q4X=float ./zig-out/bin/tensorfold-riscv bench … --pool a100
 `receipt.json` records `pool`, `hpage_arena_bytes`, `tcm_peak_bytes` and the
 throughputs, so a report line can be traced to the run that produced it.
 
-Measured receipts (this round, `~/receipts/` on the machine):
+Measured receipts (round 1, then round 2, `~/receipts/k3-a100-ime2/` and
+`round2/` on the machine):
 
 ```json
 {"command":"bench","kernels":"rvv","vlen_bits":256,"threads":8,"quant":"q4x",
- "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24832,
- "prefill_tokens":64,"prefill_tok_s":31.13,"decode_tokens":64,"decode_tok_s":24.63}
+ "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24576,
+ "prefill_tokens":64,"prefill_tok_s":38.98,"decode_tokens":64,"decode_tok_s":28.72}
 
 {"command":"bench","kernels":"rvv","vlen_bits":256,"threads":8,"quant":"q4x",
- "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24832,
- "prefill_tokens":512,"prefill_tok_s":42.33,"decode_tokens":128,"decode_tok_s":18.32}
+ "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24576,
+ "prefill_tokens":512,"prefill_tok_s":57.20,"decode_tokens":128,"decode_tok_s":20.00}
 ```
 
 ## 4. Failures found on the way (kept, because they were real)
@@ -139,15 +140,30 @@ Measured receipts (this round, `~/receipts/` on the machine):
    unit activation), the GEMM's activation blocks were addressed one tile
    apart instead of one block apart, and the prefill tail was recomputed once
    per output block (400 ms → 36 ms on the gate projection once moved out).
-6. **The RVV activation quantizer diverges from the scalar one** at VLEN=1024
-   (3.2e-1 logits, different tokens). The quantizer runs once per projection
-   over a few KiB, so the port calls the scalar form (documented at the call
-   site); the RVV form stays compiled for the vector unit work that follows.
+6. **The RVV activation quantizer silently differed from the scalar one**;
+   the difference was traced to two VLEN-dependent bugs, not rounding:
+   - the narrowing chain `i32m1 → i16mf2 → i8mf4` holds only **8 lanes at
+     VLEN=256**, so every second 16-k chunk of the quantized activation was
+     zero on the X100 (the A100's VLEN=1024 masked the bug: 32 lanes fit);
+   - the amax loop stepped by a fixed 64 while `e32m4` holds **32 lanes at
+     VLEN=256**, so the group scale sampled half the group.
+   Both are fixed with lane-count-correct register groups (`i32m2 → i16m1 →
+   i8mf2`) and a `j += vl` stride; the quantizers are now byte-identical.
+7. **The rope table's vector polynomial was wrong twice**: the Horner chain
+   used `vfmadd_vf` (which adds) where each step must multiply, and the
+   `vmerge_vvm` operand order was inverted (probed on hardware: an all-true
+   mask returns the *second* operand). Fixed; the table now agrees with libm
+   to 3.6e-8 and every gate that had silently passed before actually fails
+   when either regression is reintroduced.
+8. **The decode fusion shared the q4x path with unquantized weights** and
+   clamped shard ranges incorrectly at projection boundaries (`b - base`
+   could be negative); both caught by the host oracle, which the K3-only
+   gates had missed.
 
 ## 5. What is not done yet
 
-- The decode path is at 64 % of the vendor's `tg64` and 43 % of its `tg128`
-  (report 2 has the decomposition); the prefill path is at 14 %/13 %.
+- The decode path is at 77 % of the vendor's `tg64` and 49 % of its `tg128`
+  (report 2 has the decomposition); the prefill path is at 18 %/17.5 %.
 - The prefill GEMM is instruction/latency bound at 45 GMAC/s, far under the
   7 TMAC/s the tensor unit sustains: the per-tile epilogue (strided read-back
   and scale folding) and the A-operand reload dominate. Report 3 lists the

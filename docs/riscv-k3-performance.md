@@ -16,21 +16,24 @@ Decode `tg` and prefill `pp`, tokens per second, Qwen3-0.6B:
 | **vendor llama.cpp** | Q4_K_M | A100 + IME2 + TCM/HPAGE | **214.9** | **37.3** | **326.5** | **40.9** |
 | vendor llama.cpp | Q8_0 | A100 + IME2 | 200.1 | 30.7 | 302.2 | 32.0 |
 | vendor llama.cpp | BF16 | A100 + IME2 | 1.4 | 1.0 | 2.7 | 1.9 |
-| **TensorFold q4x** | 4-bit IME2 tiles | A100 tiles + IME2 + TCM + THP | 31.1 | **24.6** | 42.3 | **18.3** |
-| TensorFold q4x, portable float | 4-bit IME2 tiles | A100 tiles, no vmadot | 6.8 | 4.7 | — | — |
-| TensorFold q4x, portable float | 4-bit IME2 tiles | X100, 8 threads | — | — | 7.6 | 3.6 |
-| TensorFold q8_0 (previous round) | 8-bit blocks | X100, RVV | — | — | 15.2 | 11.7 |
+| **TensorFold q4x, round 2** | 4-bit IME2 tiles | A100 tiles + IME2 + TCM + THP | 39.0 | **28.7** | 57.2 | **20.0** |
+| TensorFold q4x, round 1 | 4-bit IME2 tiles | A100 tiles + IME2 + TCM + THP | 31.1 | 24.6 | 42.3 | 18.3 |
+| TensorFold q8_0 (X100 round) | 8-bit blocks | X100, RVV | — | — | 15.2 | 11.7 |
 
 Against the goal:
 
 | metric | SOTA (vendor) | 80 % gate | 110 % gate | TensorFold now | share of SOTA |
 | --- | --- | --- | --- | --- | --- |
-| tg64, user method (-t 4) | 37.3 | 29.8 | 41.0 | 24.6 | 66 % |
-| tg128, serving method (-t 8) | 40.9 | 32.7 | 45.0 | 18.3 | 45 % |
-| pp64 | 214.9 | 171.9 | 236.4 | 31.1 | 14 % |
-| pp512 | 326.5 | 261.2 | 359.2 | 42.3 | 13 % |
+| tg64, user method (-t 4) | 37.3 | 29.8 | 41.0 | 28.7 | 77 % |
+| tg128, serving method (-t 8) | 40.9 | 32.7 | 45.0 | 20.0 | 49 % |
+| pp64 | 214.9 | 171.9 | 236.4 | 39.0 | 18 % |
+| pp512 | 326.5 | 261.2 | 359.2 | 57.2 | 17.5 % |
 
-**Neither the 80 % nor the 110 % gate is met yet.** What follows is the
+**The 80 % and 110 % gates are not met.** tg64 sits at the boundary (77 %,
+one noisy run read 30.7 tok/s = 82 %), everything else is short. This is the
+round-2 state after fixing three VLEN-dependent kernel bugs (report 1
+§4.7-4.9) and the rope/quant/fusion work below; the reports are kept honest
+rather than declaring the gate early. What follows is the
 measured decomposition of the gap and the ordered plan, not a claim.
 
 Two honest wins in the same run:
@@ -49,32 +52,28 @@ Two honest wins in the same run:
 ### 2.1 Decode: kernel is close, orchestration is not
 
 Per token the model streams 298 MiB at q4x (4.06 bits per weight plus the
-8-bit embedding table). At the measured 14.4 GB/s kernel rate that is 21.7 ms,
-i.e. **46 tok/s** from the kernels alone. Measured end to end: 24.6 tok/s
-(40.6 ms per token at a 64-token context), 18.3 tok/s at a 512-token context.
-The 19 ms difference is orchestration, and the pieces are measurable:
+8-bit embedding table). At the measured 14.4 GB/s kernel rate that is
+21.7 ms, i.e. 46 tok/s from the kernels alone. Measured end to end in
+round 2: 28.7 tok/s at 64-token context (34.8 ms per token), 20.0 tok/s at
+512-token context (50.0 ms per token).
 
-| cost per token | measured / estimated | source |
-| --- | --- | --- |
-| weight stream (kernels) | 21.7 ms | 298 MiB ÷ 14.4 GB/s |
-| A100 dispatch, 196 projection calls | 2.6 ms | `probe_k3 dispatch`: 13.4 µs per 8-tile call |
-| attention (X100 RVV, 28 layers × 16 heads) | 1.5–6 ms | grows with context (the tg128 run is 6 ms/token slower than tg64) |
-| `quant_a`, 196 calls | 0.2 ms | scalar quantizer (report 1 §4.6) |
-| norms, RoPE, SwiGLU, KV writes | ~1 ms | |
+Round-2 profile (TF_RISCV_PROFILE=1, per token at 64-token context):
 
-That is 27–32 ms of 40.6 ms accounted for; the remainder is per-call fixed
-cost inside the GEMV for small shards (each of the 8 tiles runs a
-`spine_thread_tcm_malloc`-backed shard, and the 1024-row projections split into
-16 eight-row blocks per tile, where the loop's prologue matters).
+| cost | round 1 | round 2 | what changed |
+| --- | --- | --- | --- |
+| projection GEMV walls (7/layer + head) | 25.1 ms | 23.0 ms | fused q/k/v and gate/up dispatches (7 -> 5 pool runs/layer); weight streams still at ~8 GB/s effective |
+| activation quant | 5.7 ms | 0.9 ms | RVV quantizer fixed (two VLEN bugs) and re-enabled |
+| norms + rope (+ silu/adds) | 9.2 ms | 6.4 ms | rope table built once per token (vector poly, double reduction); was 28 sincos passes per token |
+| attention (64 rows) | 3.3 ms | 3.2 ms | unchanged (grows to ~6 ms at 512 rows) |
+| lm_head | 4.5 ms | 4.5 ms | unchanged |
 
-The vendor does the same work in 24.4 ms (40.9 tok/s, 372 MiB of Q4_K_M). Its
-edge is that its kernels and its graph are fused into one spine dispatch per
-layer while this round still dispatches per projection, and that it reads 20 %
-fewer bytes (4.85 vs 4.06 bits costs us *less*, so the byte count is not its
-advantage — its advantage is that it does not pay 196 dispatch round trips nor
-a separate attention pass on the X100).
+The remaining decode gap is dominated by the projection walls: the same
+kernels stream 14.4 GB/s on a contiguous benchmark buffer but ~8 GB/s on the
+model's per-tensor 2 MiB mappings, and the per-call A100 dispatch (13 us x
+~140 calls) plus per-tile startup sit inside that wall. Attention at long
+context and the lm_head (78 MiB/token) are the other two named costs.
 
-### 2.2 Prefill: the GEMM is the gap
+### 2.2 Prefill### 2.2 Prefill: the GEMM is the gap
 
 | projection shape | measured | share of vmadot peak |
 | --- | --- | --- |
