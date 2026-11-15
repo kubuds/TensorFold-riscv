@@ -88,17 +88,37 @@ static inline float fast_expf(float x) {
     return ldexpf(p, (int)k);
 }
 
-static inline void fast_sincosf(float x, float *s, float *c) {
-    const double pi = 3.141592653589793;
-    const double two_pi = 6.283185307179586;
-    double kd = round((double)x / two_pi);
-    double r = (double)x - kd * two_pi; // [-pi, pi]
+static inline void fast_sincosf(double x, float *s, float *c) {
+    // The angle stays double end to end (a float angle alone costs 2e-4 at
+    // pos 4096) and the range reduces to a quadrant: the Taylor series on
+    // [-pi/4, pi/4] is accurate to ~1e-12, while on [-pi, pi] its truncation
+    // is 5e-5 - which measured on K3 as rope drift.
+    const double half_pi = 1.5707963267948966;
+    double k4 = round(x / half_pi);
+    double r = x - k4 * half_pi; // [-pi/4, pi/4]
     double r2 = r * r;
-    double sp = r * (1.0 + r2 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362880.0 + r2 * (-1.0 / 39916800.0))))));
-    double cp = 1.0 + r2 * (-1.0 / 2.0 + r2 * (1.0 / 24.0 + r2 * (-1.0 / 720.0 + r2 * (1.0 / 40320.0 + r2 * (-1.0 / 3628800.0)))));
-    (void)pi;
-    *s = (float)sp;
-    *c = (float)cp;
+    double sp = r * (1.0 + r2 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362880.0)))));
+    double cp = 1.0 + r2 * (-1.0 / 2.0 + r2 * (1.0 / 24.0 + r2 * (-1.0 / 720.0 + r2 * (1.0 / 40320.0))));
+    long q = (long)k4 & 3;
+    if (k4 < 0) q = (q + 4) & 3;
+    switch (q) {
+        case 0:
+            *s = (float)sp;
+            *c = (float)cp;
+            break;
+        case 1:
+            *s = (float)cp;
+            *c = (float)-sp;
+            break;
+        case 2:
+            *s = (float)-sp;
+            *c = (float)-cp;
+            break;
+        default:
+            *s = (float)-cp;
+            *c = (float)sp;
+            break;
+    }
 }
 
 // bf16 u16 lanes widened into f32 vector lanes (bit pattern is f32 >> 16).
@@ -266,7 +286,7 @@ static inline void rope_head_rvv(float *h, int head_dim, int pos, float theta) {
         float cbuf[32], sbuf[32];
         if (vl > 32) vl = 32;
         for (size_t j = 0; j < vl; j++) {
-            fast_sincosf((float)((double)pos * freq), &sbuf[j], &cbuf[j]);
+            fast_sincosf((double)pos * freq, &sbuf[j], &cbuf[j]);
             freq *= step;
         }
         vfloat32m4_t va = __riscv_vle32_v_f32m4(h + i, vl);

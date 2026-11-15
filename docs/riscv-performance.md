@@ -82,8 +82,14 @@ Every change kept the numpy-oracle gates green (see the commit history):
    blocks, one reduce per row). 11.7 tok/s; the oracle models the exact
    quantization convention (f16-rounded scale, round-half-away levels).
 4. Micro work kept honest in the kernel ledger: 4-lane accumulator unroll,
-   weight-row prefetch, fast transcendentals (2-ulp exp/sin/cos) for the
-   per-token libm volume.
+   weight-row prefetch, fast transcendentals for the per-token libm volume.
+   The hardware gate caught a real bug here: the first sin/cos polynomial
+   truncated its Taylor series on [-pi, pi] (5e-5 error near pi) and cast
+   the angle to float early (2e-4 at pos 4096) - invisible in the qemu
+   tolerance budget, a 2.1e-4 rope drift against the scalar oracle on the
+   X100. Quadrant reduction to [-pi/4, pi/4] with a double angle brought
+   the hardware drift to 1.2e-7 (f32 rounding), and the K3-native suite is
+   14/14 again. This is why the report insists on machine receipts.
 
 ## 5. Micro receipts (tools/riscv/kernel_bench.c, X100 core 0)
 
