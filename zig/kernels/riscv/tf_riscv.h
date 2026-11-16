@@ -87,6 +87,19 @@ void tf_riscv_matmul_f32_shard(const float *a, const float *b, float *out, int m
 // floats (the score buffer): one dot pass per key row, not three.
 void tf_riscv_attention_f32(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
 
+// Causal attention for a block of `nb` query rows at once: query i attends
+// key rows [0, rows - nb + i]. q rows are head_dim floats `q_stride` apart,
+// out rows `out_stride` apart, k/v panels contiguous [rows, head_dim].
+// scratch holds nb*rows floats. The key rows are the OUTER loop, so each K
+// and V row is read once per block instead of once per query row - the
+// prefill bottleneck on the K3 (attention_block.c).
+float tf_riscv_attention_block_f32_dot(const float *a, const float *b, int n);
+void tf_riscv_expf_vec(float *x, int n);
+void tf_riscv_silu_mul_vec(const float *gate, const float *up, float *out, int n);
+void tf_riscv_copy_f32(float *dst, const float *src, int n);
+void tf_riscv_attention_block_f32(const float *q, int q_stride, const float *k, const float *v, float *out, int out_stride,
+                                  int nb, int rows, int head_dim, float scale, float *scratch);
+
 // Quantized GGUF block GEMV: out[n] = x[k] . w[n,k]^T, dequantizing blocks.
 // q8_0 blocks: 32 xi8 + f16 scale; q4_0 blocks: 16 bytes (32 u4) + f16 scale.
 void tf_riscv_gemv_q8_0(const float *x, const void *w, float *out, int n, int k);
@@ -139,6 +152,7 @@ void tf_riscv_gemm_q4x_shard_scalar(const int8_t *xa, const float *xs, const voi
 void *tf_riscv_scratch(size_t bytes);
 size_t tf_riscv_tcm_bytes(void);   // TCM arena this process obtained (0 = none)
 size_t tf_riscv_tcm_used(void);    // peak bytes handed out by tf_riscv_scratch
+unsigned long tf_riscv_scratch_epoch(void); // tile-execution generation
 
 // Weight arena: anonymous pages with MADV_HUGEPAGE (the vendor's HPAGE
 // backend), 2 MiB aligned. tf_riscv_hpage_available reports whether THP is

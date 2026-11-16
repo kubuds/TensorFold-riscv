@@ -634,14 +634,37 @@ fn attnShardRun(a: *AttnCtx, begin: c_int, end: c_int) void {
     const spec = s.model.spec;
     const qw = spec.heads * spec.head_dim;
     const hd = spec.head_dim;
+    // Query rows per block: the score block is nb x rows floats and every K/V
+    // row is read once per block (attention_block.c). 32 keeps the score
+    // block under 64 KiB for the 512-token prefill shapes; the scratch is
+    // the tile's TCM inside an A100 tile.
+    const nb: usize = 32;
+    const max_rows = s.pos + a.T;
+    // score block [nb][rows] plus the transposed query block [head_dim][nb]
+    const scratch = c.tf_riscv_scratch((nb * max_rows + hd * nb) * @sizeOf(f32));
+    const scratch_f: ?[*]f32 = @ptrCast(@alignCast(scratch));
     for (@as(usize, @intCast(begin))..@as(usize, @intCast(end))) |h| {
         const kvh = h / (spec.heads / spec.kv_heads);
-        const scratch = s.scratch_rows[h * s.ctx ..][0..s.ctx];
-        for (0..a.T) |t| {
-            const rows = s.pos + t + 1;
-            const krows = s.panel(s.k_cache, a.layer, kvh)[0 .. rows * hd];
-            const vrows = s.panel(s.v_cache, a.layer, kvh)[0 .. rows * hd];
-            c.tf_riscv_attention_f32(a.q[t * qw + h * hd ..].ptr, krows.ptr, vrows.ptr, a.attn[t * qw + h * hd ..].ptr, @intCast(rows), @intCast(hd), a.scale, scratch.ptr);
+        const kpanel = s.panel(s.k_cache, a.layer, kvh);
+        const vpanel = s.panel(s.v_cache, a.layer, kvh);
+        var t0: usize = 0;
+        while (t0 < a.T) {
+            const n = @min(nb, a.T - t0);
+            const rows = s.pos + t0 + n;
+            c.tf_riscv_attention_block_f32(
+                a.q[t0 * qw + h * hd ..].ptr,
+                @intCast(qw),
+                kpanel.ptr,
+                vpanel.ptr,
+                a.attn[t0 * qw + h * hd ..].ptr,
+                @intCast(qw),
+                @intCast(n),
+                @intCast(rows),
+                @intCast(hd),
+                a.scale,
+                scratch_f orelse return,
+            );
+            t0 += n;
         }
     }
 }
@@ -691,6 +714,7 @@ const FusedCtx = struct {
     xa: [*]const i8,
     xs: [*]const f32,
     k: usize,
+    m: usize,
     projs: []const FusedProj,
 };
 
@@ -705,24 +729,30 @@ fn fusedShard(ctx: ?*anyopaque, begin: c_int, end: c_int) callconv(.c) void {
         if (hi > lo) {
             const j0: c_int = @intCast(lo - base);
             const j1: c_int = @intCast(hi - base);
-            c.tf_riscv_gemv_q4x_shard(f.xa, f.xs, p.raw, p.out, @intCast(p.n), @intCast(f.k), j0, j1);
+            if (f.m == 1) {
+                c.tf_riscv_gemv_q4x_shard(f.xa, f.xs, p.raw, p.out, @intCast(p.n), @intCast(f.k), j0, j1);
+            } else {
+                c.tf_riscv_gemm_q4x_shard(f.xa, f.xs, p.raw, p.out, @intCast(f.m), @intCast(p.n), @intCast(f.k), j0, j1);
+            }
         }
         base += p.n;
     }
 }
 
-/// Decode: run `projs` projections over one activation in one dispatch.
-fn fusedProject(x: []const f32, k: usize, projs: []const FusedProj) void {
-    const pad = q4xActivation(k, 1);
-    c.tf_riscv_quant_a(x.ptr, pad.xa.ptr, pad.xs.ptr, 1, @intCast(k));
+/// Run `projs` projections over one activation (m rows) in one dispatch: the
+/// activation quantizes once for the whole set instead of once per projection
+/// (measured: 5 of pp512's 7 per-layer quant_a calls were redundant).
+fn fusedProject(x: []const f32, k: usize, m: usize, projs: []const FusedProj) void {
+    const pad = q4xActivation(k, m);
+    c.tf_riscv_quant_a(x.ptr, pad.xa.ptr, pad.xs.ptr, @intCast(m), @intCast(k));
     var total: usize = 0;
     for (projs) |p| total += p.n;
     if (pool.active() > 1) {
-        var ctx: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .projs = projs };
+        var ctx: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .m = m, .projs = projs };
         pool.run(fusedShard, &ctx, total);
         return;
     }
-    var f: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .projs = projs };
+    var f: FusedCtx = .{ .xa = pad.xa.ptr, .xs = pad.xs.ptr, .k = k, .m = m, .projs = projs };
     fusedShard(&f, 0, @intCast(total));
 }
 
@@ -937,13 +967,22 @@ pub const Session = struct {
                 dumpTensor("normed.bin", normed);
                 dumpTensor("x0.bin", x);
             }
-            m.project(l.q, normed, q, T);
+            if (l.q.kind == .q4x) {
+                // q/k/v share the activation: one quant and one dispatch.
+                var projs: [3]FusedProj = undefined;
+                projs[0] = .{ .raw = @ptrCast(@alignCast(l.q.mem.ptr)), .out = q.ptr, .n = l.q.rows };
+                projs[1] = .{ .raw = @ptrCast(@alignCast(l.k.mem.ptr)), .out = k.ptr, .n = l.k.rows };
+                projs[2] = .{ .raw = @ptrCast(@alignCast(l.v.mem.ptr)), .out = v.ptr, .n = l.v.rows };
+                fusedProject(normed, spec.hidden, T, &projs);
+            } else {
+                m.project(l.q, normed, q, T);
+                m.project(l.k, normed, k, T);
+                m.project(l.v, normed, v, T);
+            }
             if (qwen3_dump and li == 0 and s.pos == 0) {
                 dumpTensor("qout.bin", q);
                 dumpBytes("qweight.bin", l.q.mem);
             }
-            m.project(l.k, normed, k, T);
-            m.project(l.v, normed, v, T);
             for (0..T) |t_| {
                 const pos: u32 = @intCast(s.pos + t_);
                 for (0..spec.heads) |h| c.tf_riscv_rmsnorm(q[t_ * qw + h * spec.head_dim ..].ptr, l.q_norm.ptr, q[t_ * qw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim), spec.eps);
@@ -952,13 +991,23 @@ pub const Session = struct {
             }
             profAccum(phase, 3, t);
             t = nowNs();
-            for (0..T) |t_| {
+            {
+                // The panel bases are per (layer, kv head): hoisting them out
+                // of the token loop left only the row memcpy inside (the
+                // per-(token, head) pointer work measured 870 ns of the 96 ms
+                // kv-write phase at pp512).
+                const panels_k = try a.alloc([*]f32, spec.kv_heads);
+                const panels_v = try a.alloc([*]f32, spec.kv_heads);
                 for (0..spec.kv_heads) |h| {
-                    const pos: u32 = @intCast(s.pos + t_);
-                    const dst_k = s.panel(s.k_cache, li, h)[pos * spec.head_dim ..][0..spec.head_dim];
-                    const dst_v = s.panel(s.v_cache, li, h)[pos * spec.head_dim ..][0..spec.head_dim];
-                    @memcpy(dst_k, k[t_ * kvw + h * spec.head_dim ..][0..spec.head_dim]);
-                    @memcpy(dst_v, v[t_ * kvw + h * spec.head_dim ..][0..spec.head_dim]);
+                    panels_k[h] = s.panel(s.k_cache, li, h).ptr;
+                    panels_v[h] = s.panel(s.v_cache, li, h).ptr;
+                }
+                for (0..T) |t_| {
+                    const pos: usize = s.pos + t_;
+                    for (0..spec.kv_heads) |h| {
+                        c.tf_riscv_copy_f32(panels_k[h] + pos * spec.head_dim, k[t_ * kvw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim));
+                        c.tf_riscv_copy_f32(panels_v[h] + pos * spec.head_dim, v[t_ * kvw + h * spec.head_dim ..].ptr, @intCast(spec.head_dim));
+                    }
                 }
             }
             profAccum(phase, 4, t);
@@ -994,11 +1043,11 @@ pub const Session = struct {
                 dumpTensor("gate-in.bin", normed);
                 dumpBytes("gate-w.bin", l.gate.mem);
             }
-            if (T == 1 and l.gate.kind == .q4x) {
+            if (l.gate.kind == .q4x) {
                 var projs: [2]FusedProj = undefined;
                 projs[0] = .{ .raw = @ptrCast(@alignCast(l.gate.mem.ptr)), .out = gate.ptr, .n = l.gate.rows };
                 projs[1] = .{ .raw = @ptrCast(@alignCast(l.up.mem.ptr)), .out = up.ptr, .n = l.up.rows };
-                fusedProject(normed, spec.hidden, &projs);
+                fusedProject(normed, spec.hidden, T, &projs);
             } else {
                 m.project(l.gate, normed, gate, T);
                 m.project(l.up, normed, up, T);

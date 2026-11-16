@@ -32,6 +32,7 @@ typedef struct {
     void (*matmul_bf16_shard)(const float *, const uint16_t *, float *, int, int, int, int, int);
     void (*matmul_f32_shard)(const float *, const float *, float *, int, int, int, int, int, int);
     void (*attention_f32)(const float *, const float *, const float *, float *, int, int, float, float *);
+    void (*attention_block)(const float *, int, const float *, const float *, float *, int, int, int, int, float, float *);
     void (*gemv_q8_0)(const float *, const void *, float *, int, int);
     void (*gemv_q4_0)(const float *, const void *, float *, int, int);
     void (*matmul_q8_0_shard)(const float *, const void *, float *, int, int, int, int, int);
@@ -50,6 +51,11 @@ void tf_riscv_matmul_bf16_scalar(const float *x, const uint16_t *w, float *out, 
 void tf_riscv_matmul_bf16_shard_scalar(const float *x, const uint16_t *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_matmul_f32_shard_scalar(const float *a, const float *b, float *out, int m, int n, int k, int trans_b, int j0, int j1);
 void tf_riscv_attention_f32_scalar(const float *q, const float *k, const float *v, float *out, int rows, int head_dim, float scale, float *scratch);
+
+// One shared block-attention implementation for every family (attention_block.c):
+// identical numbers whichever family runs it.
+void tf_riscv_attention_block_f32(const float *q, int q_stride, const float *k, const float *v, float *out, int out_stride,
+                                  int nb, int rows, int head_dim, float scale, float *scratch);
 void tf_riscv_gemv_q8_0_scalar(const float *x, const void *w, float *out, int n, int k);
 void tf_riscv_matmul_q8_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
 void tf_riscv_matmul_q4_0_shard_scalar(const float *x, const void *w, float *out, int m, int n, int k, int j0, int j1);
@@ -69,6 +75,7 @@ static const tf_riscv_ops scalar_ops = {
     tf_riscv_matmul_bf16_shard_scalar,
     tf_riscv_matmul_f32_shard_scalar,
     tf_riscv_attention_f32_scalar,
+    tf_riscv_attention_block_f32,
     tf_riscv_gemv_q8_0_scalar,
     tf_riscv_gemv_q4_0_scalar,
     tf_riscv_matmul_q8_0_shard_scalar,
@@ -107,6 +114,7 @@ static const tf_riscv_ops rvv_ops = {
     tf_riscv_matmul_bf16_shard_rvv,
     tf_riscv_matmul_f32_shard_rvv,
     tf_riscv_attention_f32_rvv,
+    tf_riscv_attention_block_f32,
     tf_riscv_gemv_q8_0_rvv,
     tf_riscv_gemv_q4_0_rvv,
     tf_riscv_matmul_q8_0_shard_rvv,
@@ -149,6 +157,7 @@ static const tf_riscv_ops ime2_ops = {
     tf_riscv_matmul_bf16_shard_ime2,
     tf_riscv_matmul_f32_shard_ime2,
     tf_riscv_attention_f32_ime2,
+    tf_riscv_attention_block_f32,
     tf_riscv_gemv_q8_0_ime2,
     tf_riscv_gemv_q4_0_ime2,
     tf_riscv_matmul_q8_0_shard_ime2,

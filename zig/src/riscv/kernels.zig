@@ -22,12 +22,15 @@ pub const c = struct {
     pub extern "C" fn tf_riscv_matmul_bf16_shard(x: [*]const f32, w: [*]const u16, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
     pub extern "C" fn tf_riscv_matmul_f32_shard(a: [*]const f32, b: [*]const f32, out: [*]f32, m: c_int, n: c_int, k: c_int, trans_b: c_int, j0: c_int, j1: c_int) void;
     pub extern "C" fn tf_riscv_attention_f32(q: [*]const f32, k: [*]const f32, v: [*]const f32, out: [*]f32, rows: c_int, head_dim: c_int, scale: f32, scratch: [*]f32) void;
+    pub extern "C" fn tf_riscv_copy_f32(dst: [*]f32, src: [*]const f32, n: c_int) void;
+    pub extern "C" fn tf_riscv_attention_block_f32(q: [*]const f32, q_stride: c_int, k: [*]const f32, v: [*]const f32, out: [*]f32, out_stride: c_int, nb: c_int, rows: c_int, head_dim: c_int, scale: f32, scratch: [*]f32) void;
     pub extern "C" fn tf_riscv_gemv_q8_0(x: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
     pub extern "C" fn tf_riscv_gemv_q4_0(x: [*]const f32, w: *const anyopaque, out: [*]f32, n: c_int, k: c_int) void;
     pub extern "C" fn tf_riscv_matmul_q8_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
     pub extern "C" fn tf_riscv_matmul_q4_0_shard(x: [*]const f32, w: *const anyopaque, out: [*]f32, m: c_int, n: c_int, k: c_int, j0: c_int, j1: c_int) void;
 
     // q4x: 4-bit weights in IME2 dot tiles (zig/kernels/riscv/q4x.c).
+    pub extern "C" fn tf_riscv_scratch(bytes: usize) ?*anyopaque;
     pub extern "C" fn tf_riscv_q4x_block_bytes(k: c_int) usize;
     pub extern "C" fn tf_riscv_q4x_row_bytes(k: c_int) usize;
     pub extern "C" fn tf_riscv_q4x_ok(k: c_int) c_int;

@@ -110,6 +110,7 @@ static __thread size_t tls_tcm_cap = 0;
 static __thread size_t tls_tcm_used = 0;
 static __thread unsigned char *tls_heap = NULL;
 static __thread size_t tls_heap_cap = 0;
+static __thread unsigned long tls_epoch = 0;
 static size_t tcm_peak_used = 0;
 
 static void *thread_scratch(size_t bytes) {
@@ -163,6 +164,7 @@ static void tcm_release_tile(void) {
 static void tcm_enter(int64_t ctx) {
     tls_tile_ctx = ctx;
     tls_tcm_used = 0;
+    tls_epoch++;
     const char *off = getenv("TF_RISCV_TCM");
     if (off && strcmp(off, "0") == 0) return;
     if (tls_tcm || !spert.tcm_malloc) return;
@@ -378,6 +380,10 @@ void tf_riscv_pool_stop(void) {
     free(p->workers);
     free(p);
 }
+
+// The tile-execution epoch: scratch cached by a kernel is valid only for the
+// epoch it was taken in (the TCM bump resets every dispatch).
+unsigned long tf_riscv_scratch_epoch(void) { return tls_epoch; }
 
 int tf_riscv_pool_active(void) {
     if (placement_is_a100()) {

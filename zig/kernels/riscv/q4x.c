@@ -205,23 +205,32 @@ void tf_riscv_quant_a_rvv(const float *x, int8_t *xa, float *xs, int m, int k) {
             const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
             const float inv = d > 0.0f ? 1.0f / d : 0.0f;
             xs[(size_t)i * groups + g] = d;
-            for (int c = 0; c < Q4X_GROUP / 16; c++) {
+            const size_t vl = __riscv_vsetvl_e32m2(16);
+            for (int c = 0; c < Q4X_GROUP / 16; c += 4) {
+                // Four 16-lane chunks per iteration (see the loop header):
+                // the vsetvl and pointer work was the quantizer's overhead.
                 const int kc = g * (Q4X_GROUP / 16) + c;
-                int8_t *tile = (int8_t *)q4x_a_tile(xa, i, k, kc);
+                int8_t *t0 = (int8_t *)q4x_a_tile(xa, i, k, kc + 0);
+                int8_t *t1 = (int8_t *)q4x_a_tile(xa, i, k, kc + 1);
+                int8_t *t2 = (int8_t *)q4x_a_tile(xa, i, k, kc + 2);
+                int8_t *t3 = (int8_t *)q4x_a_tile(xa, i, k, kc + 3);
                 const float *p = src + c * 16;
-                // Narrowing needs the source register group to be twice the
-                // destination LMUL, so the whole 16-lane chunk runs at m2:
-                // i32m2 (16 lanes at VLEN=256) -> i16m1 -> i8mf2. The old
-                // i32m1/mf4 chain only stored 8 bytes per chunk at VLEN=256:
-                // the half-zero activation that made the X100 quant differ
-                // from the scalar oracle.
-                size_t vl = __riscv_vsetvl_e32m2(16);
-                vfloat32m2_t v = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p, vl), inv, vl);
-                vint32m2_t iv = __riscv_vfcvt_x_f_v_i32m2(v, vl);
-                iv = __riscv_vmax_vx_i32m2(iv, -127, vl);
-                iv = __riscv_vmin_vx_i32m2(iv, 127, vl);
-                vint16m1_t mid = __riscv_vncvt_x_x_w_i16m1(iv, vl);
-                __riscv_vse8_v_i8mf2(tile, __riscv_vncvt_x_x_w_i8mf2(mid, vl), vl);
+                vfloat32m2_t v0 = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p, vl), inv, vl);
+                vfloat32m2_t v1 = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p + 16, vl), inv, vl);
+                vfloat32m2_t v2 = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p + 32, vl), inv, vl);
+                vfloat32m2_t v3 = __riscv_vfmul_vf_f32m2(__riscv_vle32_v_f32m2(p + 48, vl), inv, vl);
+                vint32m2_t i0 = __riscv_vfcvt_x_f_v_i32m2(v0, vl);
+                vint32m2_t i1 = __riscv_vfcvt_x_f_v_i32m2(v1, vl);
+                vint32m2_t i2 = __riscv_vfcvt_x_f_v_i32m2(v2, vl);
+                vint32m2_t i3 = __riscv_vfcvt_x_f_v_i32m2(v3, vl);
+                i0 = __riscv_vmin_vx_i32m2(__riscv_vmax_vx_i32m2(i0, -127, vl), 127, vl);
+                i1 = __riscv_vmin_vx_i32m2(__riscv_vmax_vx_i32m2(i1, -127, vl), 127, vl);
+                i2 = __riscv_vmin_vx_i32m2(__riscv_vmax_vx_i32m2(i2, -127, vl), 127, vl);
+                i3 = __riscv_vmin_vx_i32m2(__riscv_vmax_vx_i32m2(i3, -127, vl), 127, vl);
+                __riscv_vse8_v_i8mf2(t0, __riscv_vncvt_x_x_w_i8mf2(__riscv_vncvt_x_x_w_i16m1(i0, vl), vl), vl);
+                __riscv_vse8_v_i8mf2(t1, __riscv_vncvt_x_x_w_i8mf2(__riscv_vncvt_x_x_w_i16m1(i1, vl), vl), vl);
+                __riscv_vse8_v_i8mf2(t2, __riscv_vncvt_x_x_w_i8mf2(__riscv_vncvt_x_x_w_i16m1(i2, vl), vl), vl);
+                __riscv_vse8_v_i8mf2(t3, __riscv_vncvt_x_x_w_i8mf2(__riscv_vncvt_x_x_w_i16m1(i3, vl), vl), vl);
             }
         }
     }

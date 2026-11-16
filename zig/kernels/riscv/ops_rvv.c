@@ -424,17 +424,9 @@ void tf_riscv_softmax_rvv(float *x, int n) {
 }
 
 void tf_riscv_silu_mul_rvv(const float *gate, const float *up, float *out, int n) {
-    size_t i = 0, vl;
-    while (i < (size_t)n) {
-        vl = __riscv_vsetvl_e32m4((size_t)n - i);
-        float sbuf[32];
-        if (vl > 32) vl = 32;
-        for (size_t j = 0; j < vl; j++) sbuf[j] = gate[i + j] / (1.0f + fast_expf(-gate[i + j]));
-        vfloat32m4_t vs = __riscv_vle32_v_f32m4(sbuf, vl);
-        vfloat32m4_t vu = __riscv_vle32_v_f32m4(up + i, vl);
-        __riscv_vse32_v_f32m4(out + i, __riscv_vfmul_vv_f32m4(vs, vu, vl), vl);
-        i += vl;
-    }
+    // The vector form (attention_block.c): the per-element fast_expf path was
+    // 44 M scalar sigmoid calls per pp512 = 1.8 s of the 5.6 s run.
+    tf_riscv_silu_mul_vec(gate, up, out, n);
 }
 
 void tf_riscv_add_rvv(const float *a, const float *b, float *out, int n) {

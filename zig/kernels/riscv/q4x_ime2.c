@@ -39,6 +39,7 @@
 // portable scalar product so the dispatch in q4x.c stays uniform.
 void tf_riscv_gemv_q4x_ime2(const int8_t *xa, const float *xs, const void *w, float *out, int n, int k, int j0,
                             int j1) {
+    (void)n;
     tf_riscv_gemv_q4x_shard_scalar(xa, xs, w, out, n, k, j0, j1);
 }
 void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, float *out, int m, int n, int k, int j0,
@@ -160,9 +161,17 @@ void tf_riscv_gemv_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
 
 // ---- prefill: seven activation 8-row blocks per pass -----------------------
 //
-// Weight traffic is what bounds prefill here (each pass streams the shard's
-// weights once), so the pass covers 56 activation rows and a weight tile is
-// consumed by 14 vmadots: 8 output rows x 32 k x 56 rows per 128 bytes.
+// One weight tile feeds 14 vmadots: 8 output rows x 32 k x 56 activation rows
+// per 128 bytes. The pass is the OUTER loop and its activation block is staged
+// in the tile's TCM once per pass, so every weight block in the shard reads
+// its A operands from local SRAM instead of re-streaming the same 56 KiB per
+// block through the shared L2 (measured: 81 us per (pass, block) on the A100
+// tiles with A misses - every load-to-use stalled ~100 cycles - vs 4.7 us for
+// the same loop on an X100 core whose private L2 held the block).
+//
+// Rows past the pass's real rows are zeroed in the staging buffer: the fixed
+// 7-block inner loop then needs no tail path, and the store limits its vl to
+// the rows that exist.
 
 enum { GEMM_BLOCKS = 7 };
 
@@ -174,19 +183,83 @@ void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
     const size_t v64 = __riscv_vsetvl_e32m2(64);
     const long ostride = (long)n * 4;
     const int mpass = Q4X_ROWS * GEMM_BLOCKS;
-    const int full = (m / mpass) * mpass;
 
-    for (int jb = j0; jb < j1; jb += Q4X_ROWS) {
-        const int cols = (j1 - jb) < Q4X_ROWS ? (j1 - jb) : Q4X_ROWS;
-        const uint8_t *block = (const uint8_t *)w + (size_t)(jb / Q4X_ROWS) * stride;
-        const uint8_t *tiles = block + (size_t)groups * Q4X_ROWS * 2;
-        for (int m0 = 0; m0 < full; m0 += mpass) {
-            // A pass's activation block (56 rows x k int8) is read once per
-            // weight tile but only once per pass in total, so staging it in
-            // TCM costs more than it saves here (measured: 45 -> 41 GMAC/s);
-            // the decode path, which re-reads the row for every tile, does
-            // stage it (12.7 -> 15.5 GB/s).
-            const int8_t *xa_m = xa + (size_t)m0 * k;
+    // One staging allocation per shard call: inside an A100 tile this is the
+    // tile's TCM (spine_thread_tcm_malloc), elsewhere a heap buffer. It holds
+    // the pass's A block and the per-row activation scales, one 64-lane vector
+    // per (group, activation block): lane (m*8 + n) of an accumulator carries
+    // activation row m and output row n, so the scale is the outer product of
+    // the row scales (da64) and the column scales (dw64 below). Rows past m
+    // fold to zero.
+    const size_t a_bytes = (size_t)mpass * (size_t)k;
+    const size_t da_bytes = (size_t)groups * GEMM_BLOCKS * 64 * sizeof(float);
+    // The output pass block goes through TCM too: the per-row stores land in
+    // local SRAM (no cache lines to thrash between weight blocks) and the
+    // pass blits its rows to the caller's output in one streaming sweep
+    // (measured 29% of the kernel's cycles in the direct stores).
+    const int shard_cols = j1 - j0;
+    const size_t ob_bytes = (size_t)mpass * (size_t)shard_cols * sizeof(float);
+    const size_t need = a_bytes + da_bytes + ob_bytes;
+    // One staging region per tile execution, shared by the fused projections'
+    // gemm calls (they run one after another): without the cache each call
+    // takes its own ~150 KiB from the TCM bump and the third call falls back
+    // to the heap.
+    static __thread uint8_t *stage_cache = NULL;
+    static __thread size_t stage_cap = 0;
+    static __thread unsigned long stage_epoch = 0;
+    const unsigned long epoch = tf_riscv_scratch_epoch();
+    if (!stage_cache || stage_cap < need || stage_epoch != epoch) {
+        stage_cache = (uint8_t *)tf_riscv_scratch(need);
+        stage_cap = stage_cache ? need : 0;
+        stage_epoch = epoch;
+    }
+    uint8_t *stage = stage_cache;
+    if (!stage) {
+        tf_riscv_gemm_q4x_float(xa, xs, w, out, m, n, k, j0, j1);
+        return;
+    }
+    int8_t *atcm = (int8_t *)stage;
+    float (*da64)[GEMM_BLOCKS][64] = (float (*)[GEMM_BLOCKS][64])(void *)(stage + a_bytes);
+    float *oblock = (float *)(void *)(stage + a_bytes + da_bytes);
+    float dw64[64] __attribute__((aligned(64)));
+
+    for (int m0 = 0; m0 < m; m0 += mpass) {
+        const int rows = (m - m0) < mpass ? (m - m0) : mpass;
+        memcpy(atcm, xa + (size_t)m0 * k, (size_t)rows * k);
+        memset(atcm + (size_t)rows * k, 0, (size_t)(mpass - rows) * k);
+        // One scale per (row, group), broadcast across the row's eight
+        // column lanes. The flat scalar form made the compiler emit a 64-lane
+        // indexed gather (40% of the kernel's cycles in perf annotate: five
+        // vsetvli and a vluxei64 per chunk); this is one gather from an
+        // 8-value register against a constant index vector per (group, block).
+        {
+            static uint32_t idx64[64];
+            static int idx_ready = 0;
+            if (!idx_ready) {
+                for (int r = 0; r < 64; r++) idx64[r] = (uint32_t)(r >> 3);
+                idx_ready = 1;
+            }
+            const size_t v64 = __riscv_vsetvlmax_e32m2();
+            vuint32m2_t idxv = __riscv_vle32_v_u32m2(idx64, v64);
+            const size_t v8 = __riscv_vsetvl_e32m2(8);
+            for (int g = 0; g < groups; g++) {
+                for (int b = 0; b < GEMM_BLOCKS; b++) {
+                    float src8[8];
+                    for (int j = 0; j < 8; j++) {
+                        const int row = m0 + b * Q4X_ROWS + j;
+                        src8[j] = row < m ? xs[(size_t)row * groups + g] : 0.0f;
+                    }
+                    vuint32m2_t srcv = __riscv_vreinterpret_v_f32m2_u32m2(__riscv_vle32_v_f32m2(src8, v8));
+                    vuint32m2_t gath = __riscv_vrgather_vv_u32m2(srcv, idxv, v64);
+                    __riscv_vse32_v_f32m2(da64[g][b], __riscv_vreinterpret_v_u32m2_f32m2(gath), v64);
+                }
+            }
+        }
+
+        for (int jb = j0; jb < j1; jb += Q4X_ROWS) {
+            const int cols = (j1 - jb) < Q4X_ROWS ? (j1 - jb) : Q4X_ROWS;
+            const uint8_t *block = (const uint8_t *)w + (size_t)(jb / Q4X_ROWS) * stride;
+            const uint8_t *tiles = block + (size_t)groups * Q4X_ROWS * 2;
             float facc[GEMM_BLOCKS][64] __attribute__((aligned(64)));
             memset(facc, 0, sizeof(facc));
             for (int g = 0; g < groups; g++) {
@@ -208,8 +281,8 @@ void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
                     const int kc = g * (Q4X_GROUP / 32) + c;
                     if (c + 2 < Q4X_GROUP / 32) __builtin_prefetch(tiles + (size_t)(kc + 2) * Q4X_TILE, 0, 1);
                     const uint8_t *tile = tiles + (size_t)kc * Q4X_TILE;
-                    const int8_t *a0 = a_tile(xa_m, 0, k, 2 * kc);
-                    const int8_t *a1 = a_tile(xa_m, 0, k, 2 * kc + 1);
+                    const int8_t *a0 = a_tile(atcm, 0, k, 2 * kc);
+                    const int8_t *a1 = a_tile(atcm, 0, k, 2 * kc + 1);
                     __asm__ volatile(
                         "vsetvli t0, zero, e8, m1  \n\t"
                         "vle8.v  v0, (%[t])        \n\t"
@@ -284,41 +357,72 @@ void tf_riscv_gemm_q4x_ime2(const int8_t *xa, const float *xs, const void *w, fl
                       [o5] "r"(iacc[5]), [o6] "r"(iacc[6])
                     : "t0", "memory");
                 // Fold this group: lane (m*8 + n) carries output row n of
-                // activation row m0 + 8*b + m, scaled by d_w[n][g] * d_a[m][g].
+                // activation row m0 + 8*b + m, scaled by d_w[n][g] * d_a[m][g]
+                // (the row scale is per lane group of 8, NOT one per block).
                 float dw[Q4X_ROWS];
                 const uint16_t *sc = (const uint16_t *)(block + (size_t)g * Q4X_ROWS * 2);
                 for (int r = 0; r < Q4X_ROWS; r++) dw[r] = half_to_f32(sc[r]);
-                // The 64-lane weight-scale vector repeats dw every 8 lanes;
-                // build it once per group instead of 64 scalar stores per
-                // block (the previous inner loop was most of the epilogue).
-                float dw64[64] __attribute__((aligned(64)));
-                for (int r = 0; r < 64; r++) dw64[r] = dw[r & 7];
+                // dw64 repeats dw every 8 lanes: one gather against a
+                // constant index. The flat scalar form compiled into a
+                // 64-lane indexed gather (38% of the kernel's cycles in
+                // perf annotate), same treatment as the row-scale build.
+                {
+                    static uint32_t idx8[64];
+                    static int idx_ready = 0;
+                    if (!idx_ready) {
+                        for (int r = 0; r < 64; r++) idx8[r] = (uint32_t)(r & 7);
+                        idx_ready = 1;
+                    }
+                    vuint32m2_t idxv = __riscv_vle32_v_u32m2(idx8, v64);
+                    const size_t v8l = __riscv_vsetvl_e32m2(Q4X_ROWS);
+                    vuint32m2_t srcv = __riscv_vreinterpret_v_f32m2_u32m2(__riscv_vle32_v_f32m2(dw, v8l));
+                    vuint32m2_t gath = __riscv_vrgather_vv_u32m2(srcv, idxv, v64);
+                    __riscv_vse32_v_f32m2(dw64, __riscv_vreinterpret_v_u32m2_f32m2(gath), v64);
+                }
                 vfloat32m2_t wv = __riscv_vle32_v_f32m2(dw64, v64);
                 for (int b = 0; b < GEMM_BLOCKS; b++) {
                     vfloat32m2_t fv = __riscv_vfcvt_f_x_v_f32m2(__riscv_vle32_v_i32m2(iacc[b], v64), v64);
                     vfloat32m2_t fa = __riscv_vle32_v_f32m2(facc[b], v64);
+                    vfloat32m2_t dav = __riscv_vle32_v_f32m2(da64[g][b], v64);
                     fv = __riscv_vfmul_vv_f32m2(fv, wv, v64);
-                    fa = __riscv_vfmacc_vf_f32m2(fa, xs[(size_t)(m0 / Q4X_ROWS + b) * groups + g], fv, v64);
+                    fa = __riscv_vfmacc_vv_f32m2(fa, fv, dav, v64);
                     __riscv_vse32_v_f32m2(facc[b], fa, v64);
                 }
             }
-            // Store: for output column n, lanes {n, n+8, ...} are the eight
-            // activation rows of that column, written to out[row][jb + n].
+            // Store per row into the pass block: lanes m*8..m*8+7 of block b
+            // are one activation row's eight contiguous output columns. The
+            // block lives in TCM, so the row scatter costs nothing, and the
+            // pass blits below streams the rows into the caller's output.
+            const size_t vlc = __riscv_vsetvl_e32m1((size_t)cols);
+            const size_t col0 = (size_t)(jb - j0);
             for (int b = 0; b < GEMM_BLOCKS; b++) {
                 const int row0 = m0 + b * Q4X_ROWS;
-                for (int nc = 0; nc < cols; nc++) {
-                    vint32m1_t v = __riscv_vlse32_v_i32m1((const int32_t *)(facc[b] + nc), 32, v8);
-                    __riscv_vsse32_v_i32m1((int32_t *)(out + (size_t)row0 * n + (jb + nc)), ostride, v, v8);
+                int keep = m - row0;
+                if (keep <= 0) continue;
+                if (keep > Q4X_ROWS) keep = Q4X_ROWS;
+                for (int r = 0; r < keep; r++) {
+                    vfloat32m1_t v = __riscv_vle32_v_f32m1(facc[b] + (size_t)r * Q4X_ROWS, vlc);
+                    __riscv_vse32_v_f32m1(oblock + (size_t)(b * Q4X_ROWS + r) * shard_cols + col0, v, vlc);
                 }
             }
         }
-    }
-    // Rows past the last full pass go through the portable float kernel: the
-    // tail starts on an 8-row boundary, so the packed activation and scale
-    // arrays shift by whole rows.
-    if (full < m) {
-        tf_riscv_gemm_q4x_float(xa + (size_t)full * k, xs + (size_t)full * groups, w, out + (size_t)full * n, m - full, n,
-                                k, j0, j1);
+        // Blit the pass block to the output: one contiguous sweep per row,
+        // no weight traffic competing for the cache any more.
+        {
+            const int rows = (m - m0) < mpass ? (m - m0) : mpass;
+            const size_t vlc = __riscv_vsetvlmax_e32m1();
+            for (int r = 0; r < rows; r++) {
+                const float *src = oblock + (size_t)r * shard_cols;
+                float *dst = out + (size_t)(m0 + r) * n + j0;
+                size_t c = 0;
+                while (c < (size_t)shard_cols) {
+                    size_t vl = __riscv_vsetvl_e32m1((size_t)shard_cols - c);
+                    __riscv_vse32_v_f32m1(dst + c, __riscv_vle32_v_f32m1(src + c, vl), vl);
+                    c += vl;
+                }
+            }
+            (void)vlc;
+        }
     }
 }
 

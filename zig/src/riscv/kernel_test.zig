@@ -436,3 +436,41 @@ test "riscv kernels: q4x GEMV and prefill GEMM against the float64 reference" {
         }
     }
 }
+
+test "riscv kernels: block attention matches the per-row kernel" {
+    const a = t.allocator;
+    for ([_]usize{ 64, 128 }) |hd| {
+        const nb: usize = 8;
+        const rows: usize = 24;
+        const q = try a.alloc(f32, nb * hd);
+        defer a.free(q);
+        const k = try a.alloc(f32, rows * hd);
+        defer a.free(k);
+        const v = try a.alloc(f32, rows * hd);
+        defer a.free(v);
+        fill(q, hd + 1);
+        fill(k, hd + 2);
+        fill(v, hd + 3);
+        const out_b = try a.alloc(f32, nb * hd);
+        defer a.free(out_b);
+        const out_r = try a.alloc(f32, nb * hd);
+        defer a.free(out_r);
+        const scratch = try a.alloc(f32, nb * rows + hd * nb);
+        defer a.free(scratch);
+        c.tf_riscv_attention_block_f32(q.ptr, @intCast(hd), k.ptr, v.ptr, out_b.ptr, @intCast(hd), @intCast(nb),
+            @intCast(rows), @intCast(hd), 0.25, scratch.ptr);
+        const row_scratch = try a.alloc(f32, rows);
+        defer a.free(row_scratch);
+        for (0..nb) |i| {
+            const prefix = rows - nb + i + 1;
+            c.tf_riscv_attention_f32(q[i * hd ..].ptr, k.ptr, v.ptr, out_r[i * hd ..].ptr, @intCast(prefix), @intCast(hd),
+                0.25, row_scratch.ptr);
+        }
+        // The per-row kernel's score dots widen to f64 like the scalar
+        // family; the block kernel is f32 end to end, so compare at the
+        // f32-accumulation tolerance.
+        const out_rf = try toF64(a, out_r);
+        defer a.free(out_rf);
+        try expectClose(out_b, out_rf, 1e-3, 1e-5);
+    }
+}
