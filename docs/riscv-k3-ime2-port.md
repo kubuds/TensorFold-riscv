@@ -24,6 +24,8 @@ a K3-specific path:
 | TCM | `zig/kernels/riscv/pool.c` (`tf_riscv_scratch`) | Each A100 tile takes up to 320 KiB of its worker-local TCM via `spine_thread_tcm_malloc` and carves kernel scratch from it. The decode kernel stages the quantized activation row there (measured 12.7 → 15.4 GB/s). |
 | HPAGE | `zig/kernels/riscv/mem.c`, `zig/src/riscv/hpage.zig` | The model arena is anonymous memory mapped 2 MiB-aligned with `MADV_HUGEPAGE` (the vendor's `mem_backend=HPAGE`), `--mem hpage\|plain`. |
 | q4x format | `zig/src/riscv/qwen3.zig`, `zig/kernels/riscv/q4x.c` | 4-bit weights in vmadot tiles: 8 output rows × 32 k per 128 bytes, `(k/256)` groups × 8 rows of f16 scales per block, 4.0625 bits per weight. Activations are int8 per 256-value group (the vmadot A operand). |
+| GEMM staging | `zig/kernels/riscv/q4x_ime2.c` | The prefill GEMM's pass is the outer loop; its activation block, its scale vectors and its output block all live in the tile's TCM (one staging region per tile execution, shared by the fused projections). |
+| block attention | `zig/kernels/riscv/attention_block.c` | 32 query rows per call: transposed score product (no per-pair reductions), key-major score block, row-wise vector-exp softmax against per-column max/sum vectors, value mix with the outputs in registers and four query rows per V row load. |
 | CLI | `zig/src/riscv/main.zig` | `--quant q4x`, `--pool auto\|x100\|a100`, `--mem hpage\|plain`, `--tcm-kb N`; `bench`/`run` reports carry `pool`, `hpage_arena_bytes`, `tcm_peak_bytes`. |
 
 Env switches for experiments: `TF_RISCV_Q4X=scalar|float|ime2` (kernel family),
@@ -111,18 +113,19 @@ TF_RISCV_Q4X=float ./zig-out/bin/tensorfold-riscv bench … --pool a100
 `receipt.json` records `pool`, `hpage_arena_bytes`, `tcm_peak_bytes` and the
 throughputs, so a report line can be traced to the run that produced it.
 
-Measured receipts (round 1, then round 2, `~/receipts/k3-a100-ime2/` and
-`round2/` on the machine):
+Measured receipts (round 1, round 2, then round 3; `~/receipts/k3-a100-ime2/`
+with `round2/` and `round3/` on the machine):
 
 ```json
-{"command":"bench","kernels":"rvv","vlen_bits":256,"threads":8,"quant":"q4x",
- "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24576,
- "prefill_tokens":64,"prefill_tok_s":38.98,"decode_tokens":64,"decode_tok_s":28.72}
+{"command":"bench","kernels":"rvv","threads":8,"quant":"q4x","pool":"a100",
+ "prefill_tokens":64,"prefill_tok_s":247.9,"decode_tokens":64,"decode_tok_s":36.6}
 
-{"command":"bench","kernels":"rvv","vlen_bits":256,"threads":8,"quant":"q4x",
- "pool":"a100","hpage_arena_bytes":3397386240,"tcm_peak_bytes":24576,
- "prefill_tokens":512,"prefill_tok_s":57.20,"decode_tokens":128,"decode_tok_s":20.00}
+{"command":"bench","kernels":"rvv","threads":8,"quant":"q4x","pool":"a100",
+ "prefill_tokens":512,"prefill_tok_s":253.6,"decode_tokens":128,"decode_tok_s":25.5}
 ```
+
+(round 3 medians of three runs each; the machine runs other load, so the
+runs span pp512 252-254 and pp64 247-250.)
 
 ## 4. Failures found on the way (kept, because they were real)
 
@@ -160,10 +163,44 @@ Measured receipts (round 1, then round 2, `~/receipts/k3-a100-ime2/` and
    could be negative); both caught by the host oracle, which the K3-only
    gates had missed.
 
+Round 3 (the prefill overhaul) found four more, each caught by a measurement
+gate rather than by luck:
+
+9. **The GEMM fold applied one activation scale per 8-row block** where the
+   scale is per row and per group: correct on the old tests because their
+   random rows shared one scale by construction, wrong on the model. The
+   fold now carries a 64-lane per-row scale vector per (group, block).
+10. **The scale-vector builds were compiled into 64-lane indexed gathers**
+    (`vluxei64`, five `vsetvli` per chunk): 40 % and 38 % of the GEMM's
+    cycles in `perf annotate`, from ordinary-looking scalar broadcast loops.
+    They are `vrgather` broadcasts against constant index vectors now -
+    the lesson is to check what the compiler turned the loop into, not just
+    what it says it does.
+11. **The block attention's mix loop assumed `vsetvlmax_e32m2` is 64 lanes**,
+    which is true only at the A100's VLEN=1024: at VLEN=256 the fixed two
+    chunks covered half the output. The qemu VLEN=256 gate caught it; the
+    chunk count follows the register width now. (The IME2 GEMM's 64-lane
+    folds were already safe: its dispatch requires `vlenb == 128`, so it
+    only runs at VLEN=1024.)
+12. **The KV writes paid 826 ns per 256-byte `@memcpy`** through the Zig
+    runtime's variable-length path (115 k copies at pp512 = 95 ms). A
+    one-vector-pair C copy and hoisted panel pointers took it to noise.
+
+Plus the measured finding that shaped the whole round: **the A100 tiles run
+every vector op at roughly 10-20 ns of exposed cost** (load-to-use chains on
+the spine-scheduled cores), so kernels win by cutting the number of ops per
+MAC and the bytes per op - the transposed attention product (1 op per 4
+scores), the TCM staging (no DRAM loads in the inner loop) and the fused
+dispatches (one quant per activation instead of one per projection) all
+follow from that.
+
 ## 5. What is not done yet
 
-- The decode path is at 77 % of the vendor's `tg64` and 49 % of its `tg128`
-  (report 2 has the decomposition); the prefill path is at 18 %/17.5 %.
+- Against the vendor numbers re-measured at matching `-t 8` (report 2):
+  pp512 at 77 %, pp64 at 68 % (115 % of the `-t 4` user-method number),
+  tg64 at 88 % (97 % of `-t 4`), tg128 at 62 %.
+- The 80 % and 110 % gates the project set are not met on all four axes;
+  report 2 carries the per-metric status and the measured remaining work.
 - The prefill GEMM is instruction/latency bound at 45 GMAC/s, far under the
   7 TMAC/s the tensor unit sustains: the per-tile epilogue (strided read-back
   and scale folding) and the A-operand reload dominate. Report 3 lists the

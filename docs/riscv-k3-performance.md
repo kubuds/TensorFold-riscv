@@ -1,178 +1,161 @@
-# K3 performance against SpacemiT's llama.cpp: where the port stands
+# K3 prefill against SpacemiT's llama.cpp: the 80 % comparison
 
 Reports 2 and 3 of the K3 A100 port (report 1 is the
-[reproduction guide](riscv-k3-ime2-port.md)). The baseline of record is
-SpacemiT's own llama.cpp: `llama.cpp-tools-spacemit 0.2.2` from
-archive.spacemit.com, device `SPACEMIT`, `use_ime2=1`, compute on the A100 set
-(`cpu_mask: ff00`), `mem_backend: HPAGE`, TCM available. Both engines run the
-same Qwen3-0.6B checkpoint on the same machine (`k3pico16g.local`).
+[reproduction guide](riscv-k3-ime2-port.md)). This document compares
+TensorFold's q4x path (A100 tiles + IME2 `vmadot` + TCM + HPAGE) against
+SpacemiT's own llama.cpp on the same Qwen3-0.6B checkpoint and the same
+board. Every vendor number in it was **re-measured this session** with the
+board's `llama.cpp-tools-spacemit` (build `51c81f90f`), and every TensorFold
+number is the median of three runs with the receipts in
+`~/receipts/k3-a100-ime2/round3/` on the machine.
 
-## 1. Where the port stands (measured)
+## 1. The comparison
 
-Decode `tg` and prefill `pp`, tokens per second, Qwen3-0.6B:
+The vendor publishes a four-thread "user method" pair and an eight-thread
+serving pair. TensorFold runs 8 A100 tiles, so the `-t 8` rows are the
+resource-matched baseline; the `-t 4` rows are shown because they are the
+review's headline numbers.
 
-| engine | quant | placement | pp64 (t4) | tg64 (t4) | pp512 (t8) | tg128 (t8) |
-| --- | --- | --- | --- | --- | --- | --- |
-| **vendor llama.cpp** | Q4_K_M | A100 + IME2 + TCM/HPAGE | **214.9** | **37.3** | **326.5** | **40.9** |
-| vendor llama.cpp | Q8_0 | A100 + IME2 | 200.1 | 30.7 | 302.2 | 32.0 |
-| vendor llama.cpp | BF16 | A100 + IME2 | 1.4 | 1.0 | 2.7 | 1.9 |
-| **TensorFold q4x, round 2** | 4-bit IME2 tiles | A100 tiles + IME2 + TCM + THP | 39.0 | **28.7** | 57.2 | **20.0** |
-| TensorFold q4x, round 1 | 4-bit IME2 tiles | A100 tiles + IME2 + TCM + THP | 31.1 | 24.6 | 42.3 | 18.3 |
-| TensorFold q8_0 (X100 round) | 8-bit blocks | X100, RVV | — | — | 15.2 | 11.7 |
-
-Against the goal:
-
-| metric | SOTA (vendor) | 80 % gate | 110 % gate | TensorFold now | share of SOTA |
+| shape | vendor `-t 4` | vendor `-t 8` | TensorFold (8 tiles) | of `-t 8` | of `-t 4` |
 | --- | --- | --- | --- | --- | --- |
-| tg64, user method (-t 4) | 37.3 | 29.8 | 41.0 | 28.7 | 77 % |
-| tg128, serving method (-t 8) | 40.9 | 32.7 | 45.0 | 20.0 | 49 % |
-| pp64 | 214.9 | 171.9 | 236.4 | 39.0 | 18 % |
-| pp512 | 326.5 | 261.2 | 359.2 | 57.2 | 17.5 % |
+| pp64 | 215.1 | 367.2 | **247.9** | 67.5 % | **115.3 %** |
+| tg64 | 37.8 | 41.5 | **36.6** | 88.2 % | **96.9 %** |
+| pp512 | — | 329.8 | **253.6** | 76.9 % | — |
+| tg128 | — | 40.9 | **25.5** | 62.4 % | — |
 
-**The 80 % and 110 % gates are not met.** tg64 sits at the boundary (77 %,
-one noisy run read 30.7 tok/s = 82 %), everything else is short. This is the
-round-2 state after fixing three VLEN-dependent kernel bugs (report 1
-§4.7-4.9) and the rope/quant/fusion work below; the reports are kept honest
-rather than declaring the gate early. What follows is the
-measured decomposition of the gap and the ordered plan, not a claim.
+All figures are tok/s, Qwen3-0.6B, Q4_K_M (vendor) vs q4x 4.06 bits/weight
+(TensorFold), `pp` = prefill tokens/s, `tg` = decode tokens/s after that
+prefill - the llama-bench method on both sides.
 
-Two honest wins in the same run:
+### Gate status
 
-- the decode kernel (a single projection) now streams **15.4 GB/s** on the
-  `lm_head` shape (151936×1024) and 14.4 GB/s on 3072×1024, against an
-  effective ~16 GB/s for the vendor's whole decode — i.e. **the kernel is at
-  ~95 % of the vendor's streaming rate**, and the remaining decode gap is
-  outside the weight stream;
-- the previous round's best decode was 11.7 tok/s (q8_0 on the X100); the
-  IME2 path is **2.1× that**, and 5.2× the same 4-bit model on the portable
-  float path.
+The project set two gates: 80 % of the vendor SOTA and 110 %. Per metric,
+against the resource-matched `-t 8` baseline:
 
-## 2. Performance against the vendor baseline
+| metric | 80 % gate | 110 % gate | TensorFold | status |
+| --- | --- | --- | --- | --- |
+| tg64 | 33.2 | 45.7 | 36.6 | **80 % met (88 %)** |
+| pp512 | 263.8 | 362.8 | 253.6 | 77 % - 4 % short of the 80 % gate |
+| pp64 | 293.8 | 403.9 | 247.9 | 68 % - and 115 % of the `-t 4` number |
+| tg128 | 32.7 | 45.0 | 25.5 | 62 % - the long-context decode gap |
 
-### 2.1 Decode: kernel is close, orchestration is not
+**Neither gate is met across the board.** What is met: tg64 at 88 % of the
+resource-matched SOTA (and 97 % of the review's headline number), pp64 at
+115 % of the headline number. What is not: pp512 (77 %) and tg128 (62 %).
+Report 3 (the 110 % report) is therefore **not due**; section 4 carries its
+measured plan instead.
 
-Per token the model streams 298 MiB at q4x (4.06 bits per weight plus the
-8-bit embedding table). At the measured 14.4 GB/s kernel rate that is
-21.7 ms, i.e. 46 tok/s from the kernels alone. Measured end to end in
-round 2: 28.7 tok/s at 64-token context (34.8 ms per token), 20.0 tok/s at
-512-token context (50.0 ms per token).
+## 2. What changed to get here
 
-Round-2 profile (TF_RISCV_PROFILE=1, per token at 64-token context):
+Round 2 ended at pp512 57.2 / pp64 39.0 / tg64 28.7 / tg128 20.0 tok/s.
+Round 3 moved prefill 4.4-6.4x. The phase profile (a cumulative per-phase
+timer in `Session.forward`, `TF_RISCV_PROFILE=1`) named the costs; each fix
+below has its measured effect on the board:
 
-| cost | round 1 | round 2 | what changed |
+| cost (pp512) | round 2 | round 3 | what moved it |
 | --- | --- | --- | --- |
-| projection GEMV walls (7/layer + head) | 25.1 ms | 23.0 ms | fused q/k/v and gate/up dispatches (7 -> 5 pool runs/layer); weight streams still at ~8 GB/s effective |
-| activation quant | 5.7 ms | 0.9 ms | RVV quantizer fixed (two VLEN bugs) and re-enabled |
-| norms + rope (+ silu/adds) | 9.2 ms | 6.4 ms | rope table built once per token (vector poly, double reduction); was 28 sincos passes per token |
-| attention (64 rows) | 3.3 ms | 3.2 ms | unchanged (grows to ~6 ms at 512 rows) |
-| lm_head | 4.5 ms | 4.5 ms | unchanged |
+| projection GEMMs | 3.0 s | 0.87 s | the GEMM pass stages its activation in TCM once per pass (was: every weight block re-streamed 56 KiB through a shared L2 - 81 us per (pass, block) on the tiles vs 4.7 us on an X100 core), the output block goes through TCM and blits once per pass (the direct scatter was 29 % of the kernel), the scale-vector builds stop compiling into 64-lane gathers (40 %+38 % of cycles), q/k/v and gate/up fuse into one dispatch per set |
+| attention | 3.6 s | 0.6 s | block kernel: transposed score product (one vector of 32 query dots per key row, no per-pair reductions), key-major scores, row-wise vector exp (the libm `ldexpf` path was 105 ns/call = 1.5 s), value mix with outputs in registers and 4 query rows per V load |
+| activation quant | 0.57 s | 0.11 s | q/k/v and gate/up quantize their shared activation once (was once per projection); the quantizer's per-chunk work is 4-way unrolled |
+| silu + rmsnorm + rope | 1.2 s | 0.45 s | vector silu (44 M per-element exps were 1.8 s), rope table built once per token with a vector polynomial |
+| kv cache writes | 0.1 s | 0.09 s | hoisted panel pointers + a vector copy (the runtime `@memcpy` charged 826 ns per 256-byte copy) |
 
-The remaining decode gap is dominated by the projection walls: the same
-kernels stream 14.4 GB/s on a contiguous benchmark buffer but ~8 GB/s on the
-model's per-tensor 2 MiB mappings, and the per-call A100 dispatch (13 us x
-~140 calls) plus per-tile startup sit inside that wall. Attention at long
-context and the lm_head (78 MiB/token) are the other two named costs.
+The single kernel-level result: the gate projection's GEMM
+(m=512, n=3072, k=1024) went from 35.9 ms to 4.0 ms (45 -> 397 GMAC/s) over
+the session - TCM staging, then the two gather fixes, then the output block.
 
-### 2.2 Prefill### 2.2 Prefill: the GEMM is the gap
+Two accuracy fixes came out of the same work and are in report 1's failure
+list: the GEMM fold applied one activation scale per 8-row block instead of
+per row, and the block attention's mix loop assumed the A100's register
+width (the qemu VLEN=256 gate caught the second).
 
-| projection shape | measured | share of vmadot peak |
-| --- | --- | --- |
-| m=512, n=3072, k=1024 (gate) | 45.2 GMAC/s | 0.6 % of 7 TMAC/s |
-| m=56, n=3072, k=1024 | 56.8 GMAC/s | 0.8 % |
+## 3. Where the remaining gap lives
 
-The vendor's `pp512` (326.5 tok/s) is ~390 GFLOP/s ≈ 195 GMAC/s, i.e. 4.3× the
-port's GEMM. pp512 for this model is 305 GMAC total, so 42.3 tok/s means the
-port spends 12.1 s where the vendor spends 1.57 s.
+### 3.1 pp512: 253.6 vs 329.8 (77 %)
 
-The GEMM is not limited by the tensor unit (7 TMAC/s measured), nor by DRAM
-(the shard's weight stream is under 1 GB/s effective because a pass re-reads
-its weight block from L1/L2 across 9 m-passes). It is limited by per-tile
-overhead: each 128-byte weight tile carries 14 vmadots (14336 MACs) but the
-loop around it pays for 7 A-operand loads, the per-group epilogue (strided
-int32 read-back, 64-lane scale folding) and the per-pass store. Measured
-2.6 µs per weight tile against the ~0.6 µs the same tile costs in the decode
-loop, which does one vmadot per 128 bytes and no M-block epilogue.
+Per token the prefill costs 3.94 ms (253.6 tok/s) of which the phase profile
+puts 0.87 s of the 2.0 s run in the GEMMs, 0.6 s in attention and 0.45 s in
+norms/rope/silu. The GEMM is now balanced (perf annotate shows vmadots at
+~25 % of cycles, the fold at 20 %, the stores at 8 %, no dominant stall),
+but it runs at roughly 10-20 ns of exposed cost per vector op - a
+load-to-use bound on the spine-scheduled tiles that the vendor's kernels
+avoid by carrying their accumulators in int32 across whole k blocks and by
+never spilling a per-group epilogue into the tile's memory.
 
-### 2.3 What the port fixed relative to the previous round
+The two named gaps to close for the 80 % gate (263.2):
 
-| | previous round | now |
-| --- | --- | --- |
-| decode (tg128) | 11.7 tok/s (q8_0, X100 RVV) | 18.3 tok/s (q4x + IME2 + TCM + THP) |
-| bytes per token | 0.64 GiB (q8_0) | 0.30 GiB (q4x) |
-| A100 dispatch | 4.7 tok/s (spine, per-call stream) | 24.6 tok/s (stream held, TCM scratch, vmadot) |
-| IME2 | seam with reference math only | real `smt.vmadot` kernels, 7 TMAC/s validated |
-| memory | 4 KiB pages | `MADV_HUGEPAGE` arena, 26.6-30.0 → 40.5-51.1 GB/s (probe) |
+1. **the GEMM's per-group fold and per-tile prologue** (measured 25 %+ ~30 %
+   of the kernel): fold the scales once per pass instead of per 256-k group
+   (the group scale is constant across the 8 k-blocks of a group, so the
+   fold can move out of the tile loop entirely), and process two weight
+   blocks per asm body so the dequant and the A loads amortize across them
+   (2.5 -> ~1.8 instructions per vmadot in the inner loop). Target: GEMM
+   0.87 -> 0.6 s, pp512 -> ~275 tok/s (83 %).
+2. **the tail rows**: m=512 runs 9 full passes plus one 8-row pass through
+   the 7-block loop, i.e. 8.6 % of the GEMM's vmadots and A loads compute
+   zero-padded rows. A 1-block asm body for the last pass (2 vmadots per
+   tile instead of 14) removes it; measured cost today is ~4 % of the GEMM.
 
-## 3. Path to 80 % and 110 %, with measured targets
+### 3.2 tg128: 25.5 vs 40.9 (62 %)
 
-Ordered by measured payoff, each with the number it has to move. The 80 %
-gates are tg128 ≥ 32.7 and pp512 ≥ 261; the 110 % gates are ≥ 45.0 and ≥ 359.
+Decode at 512-token context runs 40 ms/token of which the projections are
+~23 ms (at the same rate as tg64) and attention grows to ~6 ms with the
+context (512 dots + exps + mix per head per layer). The vendor's decode is a
+fused per-layer spine call; ours is 140 dispatches per token. The measured
+path: the attention score GEMM for the single query row can use the same
+transposed product with the key row held in registers (nb=1 variant of the
+block kernel), and the per-layer dispatches can collapse to one fused
+layer call behind a `spine_ctx_sync` barrier (917 ns measured).
 
-### Step 1 — fuse the per-layer projection set into one dispatch (decode)
+### 3.3 pp64: 247.9 vs 367.2 at -t 8 (68 %) but 115 % of -t 4
 
-The port makes 7 dispatches per layer (q, k, v, o, gate, up, down) plus a
-shard call for the head. Every dispatch costs 13.4 µs (measured) and every
-shard pays a prologue. Fusing q/k/v and gate/up into single calls (they share
-the activation) and batching the layer's elementwise ops into the same call
-removes 3 of 7 dispatches per layer (196 → 112 calls per token, −1.1 ms) and
-amortizes the prologue.
+The `-t 8` vendor number scales prefill with eight threads on the A100 set;
+our 8 tiles stream the same weights but pay the per-tile startup for
+much shorter passes (11 passes at 56 rows vs their per-thread row ranges).
+Closing this one is the same GEMM work as 3.1 plus a wider m-pass (56 ->
+112 rows per pass halves the weight re-reads per projection).
 
-- measured target: **+8–12 % decode** (24.6 → 27 tok/s at 64 tokens).
-- next lever if that is not enough: one dispatch per layer with a grid-wide
-  `spine_ctx_sync` barrier (917 ns measured) between stages, 28 calls/token.
+## 4. The 110 % plan (report 3's trigger)
 
-### Step 2 — move attention to the A100 tiles and keep the KV cache in TCM
+Report 3 is written when every axis passes 110 % (pp512 362.8, tg128 45.0,
+pp64 403.9, tg64 45.7 at the `-t 8` baseline);
+[its status file](riscv-k3-performance-110.md) tracks the distance. The
+measured building blocks:
 
-Attention is 1.5 ms at 64 tokens but 6 ms at 512 tokens, and it runs on the
-X100 while the A100 tiles idle. The A100 has 1024-bit vectors and 393 KiB of
-TCM per tile; a head's 512-row KV panel is 512×128×4 = 256 KiB for K and the
-same for V, so half a tile's TCM holds one head's K at fp32, or a whole head's
-K+V at bf16.
+1. Section 3.1's fold/prologue work: pp512 ~275 (83 %).
+2. A wider m-pass (112 rows) with the weights read once per pass instead of
+   per 56 rows: prefill's weight traffic drops 2x, pp512 ~310 (94 %).
+3. INT4 activations through `vmadotu`'s i4 mode for the score GEMM and the
+   outer k steps (the vendor's own pattern: their A operand is split into
+   nibbles and the i4-mode dot covers 2x the k per instruction) - this is
+   the step that can double the GEMM again, and it needs its own accuracy
+   study before it lands.
+4. The decode-side fusion of section 3.2: tg128 ~35 (86 %), and the lm_head
+   (78 MiB of the 298 MiB per token) queued behind the last layer's
+   projections for the rest.
 
-- measured target: **−4.5 ms per token at 512 tokens**, i.e. tg128
-  18.3 → 22 tok/s.
+## 5. Reproducing these numbers
 
-### Step 3 — fix the prefill GEMM's per-tile epilogue (prefill)
+Vendor (on the board):
 
-Three changes, each measurable on the m=512 gate shape (45.2 GMAC/s today):
+```sh
+cd ~/models/gguf
+llama-bench -m Qwen3-0.6B-Q4_K_M.gguf -p 64  -n 64  -t 4
+llama-bench -m Qwen3-0.6B-Q4_K_M.gguf -p 64  -n 64  -t 8
+llama-bench -m Qwen3-0.6B-Q4_K_M.gguf -p 512 -n 128 -t 8
+```
 
-1. keep the f32 accumulators in registers instead of a stack array and fold
-   the group scale once per pass instead of once per group (the 64-lane scale
-   vector is currently rebuilt with 64 scalar stores per block per group);
-2. write the output tiles with one contiguous store per 8×8 block into a
-   tiled output buffer and transpose once per projection (the strided
-   `vsse32` per column is 8 scattered stores);
-3. hoist the A-operand pointer arithmetic out of the loop (12 runtime
-   `k/16`-scaled offsets are recomputed per tile).
+TensorFold:
 
-- measured target: the decode loop proves the tile path can carry 14336 MACs
-  per 128 bytes at 0.6 µs; closing to 2× that would put the GEMM at
-  ~150 GMAC/s → **pp512 ≈ 140 tok/s**; reaching the same per-tile efficiency
-  as decode gives ~300 GMAC/s → **pp512 ≈ 280 tok/s** (the 80 % gate).
+```sh
+cd ~/TensorFold   # or scp zig-out/bin/tensorfold-riscv after
+                  # zig build riscv-cli -Dtarget=riscv64-linux-gnu
+./zig-out/bin/tensorfold-riscv bench ~/models/qwen3-06b --quant q4x \
+  --prefill 512 --decode 128 --context 1024 --pool a100 --mem hpage
+./zig-out/bin/tensorfold-riscv bench ~/models/qwen3-06b --quant q4x \
+  --prefill 64  --decode 64  --context 256  --pool a100 --mem hpage
+```
 
-### Step 4 — 110 %: fewer bytes and a wider m-pass
-
-With the GEMM at the decode loop's efficiency the tensor unit still has 40×
-headroom, so the 110 % prefill target needs the weight stream, not the MACs:
-widen the m-pass from 56 to 168 rows (register-pressure trade: 7 → 3
-accumulator-pair groups in TCM), which cuts the weight re-reads per
-projection from 9 to 3, and keep q4x at 4.06 bits per weight against the
-vendor's 4.85. The measured streaming ceiling is 40.5-51.1 GB/s on the A100 tiles
-(probe, two runs), so pp512 is DRAM-bound at 0.30 GiB × (512/168) = 0.9 GiB → 22 ms,
-while the MACs take 305 GMAC / 7 TMAC/s = 44 ms: **pp512 ≈ 380 tok/s**, over
-the 110 % gate (359).
-
-For decode the 110 % gate (45 tok/s) needs 22.2 ms per token, which is the
-weight stream at 14.4 GB/s with *all* orchestration inside 0.5 ms. The port's
-kernel is at 95 % of the vendor's rate and 4.06 bits beats its 4.85, so the
-gate is reachable by Steps 1 and 2 plus one more: **queue the head's GEMV
-behind the last layer's projections** (the head is 78 MiB of the 298 MiB per
-token and does not depend on the KV cache), which overlaps 6.2 ms of the
-stream with the attention of the final layer.
-
-## 4. Reproducing these numbers
-
-See [report 1 §3](riscv-k3-ime2-port.md#3-reproducing-a-measurement) for the
-commands, the receipt fields and the vendor baseline files
-(`~/receipts/llama-vendor-bench.txt`, `llama-source-bench.txt`,
-`tfv4-*.json`, `probe_k3-*.txt` on the machine).
+Receipts: `~/receipts/k3-a100-ime2/round3/pp512-{1,2,3}.json` and
+`pp64-{1,2,3}.json`; the vendor's rows are in
+`~/receipts/k3-a100-ime2/round3/vendor-t4.txt` and `vendor-t8.txt`.
